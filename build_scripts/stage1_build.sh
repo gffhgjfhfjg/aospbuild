@@ -128,28 +128,71 @@ main() {
   #  绝不能按目标名切分 —— 那会破坏依赖顺序或让下游重做上游的活。
   local ninja
   ninja="$(find_ninja)"
+  local SHARD_T0=$SECONDS
 
   local rsp="$out/.stage1_targets.rsp"
   if [ "$AOSP_SKIP_METALAVA" = "1" ]; then
-    # 排除 all / clean / rebuild 这类聚合或清理目标：
-    #   all 是 metalava 的总入口，不排除会把 metalava 拉回本阶段
+    # 排除聚合/清理/入口目标：
+    #   all     是 metalava 的总入口，不排除会把 metalava 拉回本阶段
+    #   clean   会清空 out
+    #   rebuild 会先 clean
     grep -v -x -e 'all' -e 'clean' -e 'rebuild' "$out/.ninja_targets_keep.txt" > "$rsp" || true
     local n_rsp
-    n_rsp="$(wc -l < "$rsp")"
+    n_rsp="$(count_lines "$rsp")"
     log "目标清单 ${rsp}（${n_rsp} 个目标，已排除 metalava 与其 API 产物）"
     if [ "$n_rsp" -eq 0 ]; then
       die "目标清单为空，请检查 ninja 目标规划（out/.ninja_targets_keep.txt）"
     fi
+    log "目标清单前 10 个: $(head -n 10 "$rsp" | tr '\n' ' ')"
   else
     warn "AOSP_SKIP_METALAVA != 1，走 m all（含 metalava）路径，不做分片"
   fi
 
+  # ---- 自动选择执行方式（不依赖环境变量，因为 ninja 版本是未知的）----
+  local mode="$AOSP_NINJA_TARGETS_MODE"
+  if [ "$mode" = "rspfile" ] && ! ninja_supports_response_file; then
+    warn "配置的 rspfile 模式不可用（ninja 不支持 @file），自动切到 xargs 模式"
+    mode="xargs"
+  fi
+
   local build_rc=0
   if [ "$AOSP_SKIP_METALAVA" = "1" ]; then
-    set +e
-    build_with_budget "$rsp" "$out" "$AOSP_SHARD_BUDGET_MIN"
-    build_rc=$?
-    set -e
+    if [ "$mode" = "xargs" ]; then
+      # 老 ninja 不支持 @file。用 xargs 分批喂目标：
+      #   ninja 每次都会加载整张构建图(约1GB)，所以批要尽量大，减少加载次数。
+      #   正确性不受影响 —— ninja 每次调用都按完整依赖图求解，只是目标集合不同。
+      local batch="${AOSP_NINJA_XARGS_BATCH:-4000}"
+      log "使用 xargs 分批模式，每批 ${batch} 个目标（ninja 图约 1GB，批越大加载次数越少）"
+      local total_batches=$(( (n_rsp + batch - 1) / batch ))
+      log "预计调用 ninja ${total_batches} 次"
+      local i=0
+      while [ "$i" -lt "$total_batches" ]; do
+        i=$(( i + 1 ))
+        log "--- 批次 $i/$total_batches ---"
+        set +e
+        sed -n "$(( (i - 1) * batch + 1 )),$(( i * batch ))p" "$rsp" \
+          | xargs -r "$ninja" -C "$out" -j"$AOSP_BUILD_JOBS" -k "$AOSP_BUILD_KEEP_GOING"
+        local brc=$?
+        set -e
+        if [ "$brc" -ne 0 ]; then
+          err "ninja 在第 $i/$total_batches 批失败（rc=${brc}）"
+          build_rc="$BUDGET_EXIT_FAILED"
+          break
+        fi
+        # 分批模式下无法按时间预算优雅停止，改为批间检查时间
+        if [ $(( SECONDS - SHARD_T0 )) -ge $(( AOSP_SHARD_BUDGET_MIN * 60 )) ]; then
+          warn "分批模式已达时间预算，停止后续批次（已完成的批次成果保留）"
+          build_rc="$BUDGET_EXIT_EXHAUSTED"
+          break
+        fi
+      done
+      [ "$build_rc" -eq 0 ] && build_rc=0
+    else
+      set +e
+      build_with_budget "$rsp" "$out" "$AOSP_SHARD_BUDGET_MIN"
+      build_rc=$?
+      set -e
+    fi
 
     case "$build_rc" in
       0)

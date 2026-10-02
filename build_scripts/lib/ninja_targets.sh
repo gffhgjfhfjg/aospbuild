@@ -31,27 +31,94 @@ METALAVA_EXCLUDE_RE='(^|[-_/])(metalava|update-api|check-api|api-versions)([-_./
 #   重新拉回 Job2 编译，等于没做分段。
 METALAVA_EXTRA_EXCLUDE_RE='(^|[-_/])api-current([-_./]|$)|(^|[-_/])(framework-|hw-)?api-gen([-_./]|$)|(^|[-_/])api-versions([-_./]|$)|(^|/)api/(system-|test-)?current\.txt$|(^|/)api/removed\.txt$'
 
-# ninja target 探测
-ninja_list_all_targets() {
-  local out ninja
-  out="$(aosp_out)"
+# =============================================================================
+# ninja 目标枚举
+# -----------------------------------------------------------------------------
+#  【为什么不能直接用 `ninja -t targets all` —— run 36984465362 实测】
+#  AOSP 10 自带的 ninja 是 prebuilts/build-tools/linux-x86/bin/ninja，
+#  版本 **1.8.2.git**（2018 年）。它有两个限制：
+#     1) `-t targets all` 里的 `all` 被当成"要列出的文件"而不是关键字，
+#        对不存在的文件不输出任何东西 -> 目标总数 0 -> 直接 die
+#     2) 不支持 @file 响应文件（run 里已 WARN 过）
+#  所以这里做两件事：
+#     1) 先试 `ninja -t targets all`，数量明显偏少就回退到**直接解析 build.ninja**
+#     2) 响应文件能力自动探测，不支持就自动走 xargs 分批
+#
+#  直接解析是可靠的：soong 生成的 out/soong/build.ninja 里，
+#  形如 `build <name>: phony <deps...>` 的行就是可直接喂给 ninja 的目标。
+# =============================================================================
+
+# 解析 build.ninja 系列文件，取出所有可构建目标名
+_ninja_targets_from_buildfiles() {
+  local out="$1"
+  local ninja_f
+  ninja_f="$out/soong/build.ninja"
+  [ -f "$ninja_f" ] || { err "未找到 ${ninja_f}"; return 1; }
+
+  # 1) 所有 phony 目标（顶层逻辑目标，最接近 "m all" 的语义）
+  grep -hE '^build [^ ]+: phony' "$ninja_f" 2>/dev/null | awk '{print $2}' | sed 's/:$//' || true
+  # 2) 部分目标（如 dist-for-googlers、install-* 聚合）也在 build-*.ninja 里
+  local extra
+  for extra in "$out"/build-*.ninja; do
+    [ -f "$extra" ] || continue
+    grep -hE '^build [^ ]+: phony' "$extra" 2>/dev/null | awk '{print $2}' | sed 's/:$//' || true
+  done
+}
+
+ninja_supports_response_file() {
+  local ninja
   ninja="$(find_ninja)"
+  "$ninja" --help 2>&1 | grep -q '@file' && return 0 || return 1
+}
+
+ninja_list_all_targets() {
+  local out; out="$(aosp_out)"
+  local ninja; ninja="$(find_ninja)"
 
   [ -f "$out/soong/build.ninja" ] \
     || die "未找到 ${out}/soong/build.ninja，请先执行 'm nothing' 生成 soong 构建图"
 
-  log "导出 ninja 目标清单（$("$ninja" --version 2>/dev/null || echo unknown)）…"
-  # -t targets deep 2：深度 2 足以覆盖 phony 顶层目标与主要规则，
-  # -t targets all 则包含上万个文件级目标，噪音太大且会拖慢 IO
-  "$ninja" -C "$out" -t targets all 2>/dev/null \
-    | awk -F: '{print $1}' \
-    | LC_ALL=C sort -u \
-    > "$out/.ninja_targets_all.txt"
+  log "导出 ninja 目标清单（ninja 版本: $("$ninja" --version 2>/dev/null || echo unknown)）"
 
-  local n
-  n="$(wc -l < "$out/.ninja_targets_all.txt")"
-  log "ninja 目标总数: ${n}"
-  [ "$n" -eq 0 ] && die "ninja 目标清单为空，检查 soong 构建图是否损坏"
+  local f="$out/.ninja_targets_all.txt"
+
+  # ---- 尝试路径 1：ninja -t targets ----
+  : > "$f"
+  "$ninja" -C "$out" -t targets all 2>/dev/null | awk -F: 'NF>1{print $1}' >> "$f" || true
+  local n1; n1="$(count_lines "$f")"
+
+  if [ "$n1" -ge 50 ]; then
+    LC_ALL=C sort -u "$f" -o "$f"
+    log "路径1: ninja -t targets all 可用，得到 ${n1} 个目标"
+  else
+    # ---- 回退路径：直接解析 build.ninja ----
+    warn "ninja -t targets all 只得到 ${n1} 个目标（该 ninja 版本过老，run 36984465362 实测）"
+    log "回退到直接解析 build.ninja ..."
+    : > "$f"
+    _ninja_targets_from_buildfiles "$out" | LC_ALL=C sort -u > "$f" 2>/dev/null || true
+    local n2; n2="$(count_lines "$f")"
+    log "路径2: 解析 build.ninja 得到 ${n2} 个 phony 目标"
+    # 阈值取 10：真实 soong 图的 phony 目标是数千个量级，
+    # 只有解析真的失败（文件被截断/格式不认识）才会落到个位数。
+    if [ "$n2" -lt 10 ]; then
+      err "两种方式都没取到足够目标（ninja -t targets=${n1}, 解析=${n2}）"
+      err "请检查 $out/soong/build.ninja 是否正常（真实大小约 1GB）"
+      err "当前大小: $(du_gb "$out/soong/build.ninja")GB"
+      return 1
+    fi
+  fi
+
+  log "目标清单: $f（$(count_lines "$f") 个）"
+  log "前 10 个示例: $(head -n 10 "$f" | tr '\n' ' ')"
+
+  # ---- 响应文件能力探测 ----
+  if ninja_supports_response_file; then
+    log "ninja 支持 @file 响应文件 ✓（将用 rspfile 模式）"
+  else
+    warn "ninja 不支持 @file 响应文件（该版本太老），stage1 将自动改用 xargs 分批模式"
+    warn "这是 AOSP 10 自带 ninja 1.8.2 的已知限制，不影响正确性，只是 ninja 图"
+    warn "(约 1GB) 会被加载多次，因此分批粒度要尽量大。"
+  fi
 }
 
 # 分类目标：写入 $out/.ninja_targets_{exclude,keep}.txt
