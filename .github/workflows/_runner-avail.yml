@@ -1,0 +1,32 @@
+name: _runner-avail
+
+# 探测哪些 runner label 在本账号/本仓库真的可用（不参与自动构建）
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: 'probe ${{ matrix.os }}'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-22.04
+          - ubuntu-22.04-large
+          - ubuntu-22.04-2xlarge
+          - ubuntu-22.04-4xlarge
+    steps:
+      - name: 规格
+        run: |
+          set -euo pipefail
+          echo "LABEL=${{ matrix.os }}"
+          echo "CPU=$(nproc)  MEM=$(free -g | awk '/^Mem:/{print $2}')"
+          echo "DISK:"; df -hT / /mnt 2>/dev/null || df -hT /
+          echo "OS: $(. /etc/os-release && echo "$PRETTY_NAME")"
+          echo "RESULT=AVAILABLE"
