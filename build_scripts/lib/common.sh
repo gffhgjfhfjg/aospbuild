@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 # =============================================================================
 #  lib/common.sh —— 所有构建脚本共用的基础库
 # -----------------------------------------------------------------------------
@@ -168,7 +168,7 @@ require_free_gb() {
   local need="${1:-$AOSP_FREE_SPACE_GB}"
   local p="${2:-$AOSP_SRC_DIR}"
   local avail
-  avail="$(df -BG --output=avail "$p" 2>/dev/null | tail -n1 | tr -dc '0-9' || echo 0)"
+  avail="$(avail_gb "$p")"
   log "分区 ${p} 剩余 ${avail}GB，需要 >= ${need}GB"
   if [ "$avail" -lt "$need" ]; then
     err "剩余空间不足：${avail}GB < ${need}GB。"
@@ -199,6 +199,65 @@ ensure_writable_dir() {
   exit 1
 }
 
+# =============================================================================
+# 体积/空间数值读取helper
+# -----------------------------------------------------------------------------
+#  【为什么需要它们 —— 踩过的坑】
+#  1) `du -BG <dir> | cut -f1 | tr -dc '0-9'` 是错的：
+#     du 输出是 "63G<TAB>/home/runner/aosp"，cut -f1 依赖 TAB 分隔符，
+#     一旦分隔符不是 TAB（比如 locale/实现差异）就会把整行交给 tr -dc '0-9'，
+#     结果把**路径里的数字也拼进来**。run 36970996892 里就出现了
+#     source_measured_gb=1111111111111111111111111111111111111111111111111111111111
+#     （58 个 1，全来自路径 /home/runner/aosp 被重复拼接），直接导致容量守卫算错。
+#  2) `grep -c` 在匹配 0 行时打印 0 但退出码为 1，
+#     后面接 `|| echo 0` 会多出一行，变成 "0\n0" 这种两行字符串。
+#
+#  统一用下面两个函数，避免同类 bug 再次出现。
+# =============================================================================
+
+# du_gb <dir> [extra du args...]  -> 目录占用（向上取整的 GB，纯数字）
+du_gb() {
+  local d="$1"; shift
+  local v
+  [ -e "$d" ] || { echo 0; return 0; }
+  # -s = summarize，只输出体积不带路径，从根上避免路径数字被拼进来
+  v="$(du -sBG "$@" -- "$d" 2>/dev/null | head -n1 | grep -oE '[0-9]+' | head -n1 || true)"
+  case "$v" in
+    ''|*[!0-9]*) echo 0 ;;
+    *) echo "$v" ;;
+  esac
+}
+
+# avail_gb <path>  -> 分区剩余 GB（纯数字）
+avail_gb() {
+  local p="${1:-/}"
+  local v
+  v="$(df -BG --output=avail "$p" 2>/dev/null | tail -n1 | grep -oE '[0-9]+' | head -n1 || true)"
+  case "$v" in
+    ''|*[!0-9]*) echo 0 ;;
+    *) echo "$v" ;;
+  esac
+}
+
+# count_lines <file-or-stdin>  -> 行数（grep -c 语义安全的计数）
+# 用法: n=$(count_lines "$f"); n=$(some_cmd | count_lines -)
+count_lines() {
+  local src="${1:--}"
+  local n
+  if [ "$src" = "-" ]; then
+    n="$(grep -c '' || true)"
+  else
+    [ -f "$src" ] || { echo 0; return 0; }
+    n="$(grep -c '' < "$src" || true)"
+  fi
+  case "$n" in
+    ''|*[!0-9]*) echo 0 ;;
+    *) echo "$n" ;;
+  esac
+}
+
+# 编译前容量预估：见下方 project_build_capacity
+# =============================================================================
 # 容量守卫（两阶段）
 # -----------------------------------------------------------------------------
 #  用法: project_build_capacity [pre_sync|post_sync]
@@ -206,12 +265,18 @@ ensure_writable_dir() {
 #  【为什么要分两阶段 —— 这里踩过一个致命的公式错误】
 #  `df --output=avail` 给的是"当前剩余空间"。源码一旦 repo sync 落盘，
 #  它就已经从 avail 里扣掉了。如果再把 src_gb 加进需求侧，就等于把源码算了两遍：
-#      磁盘 49GB 剩余 / 源码已占 62GB / 需求侧写成 62+42=104GB  ->  必然误报"容量不足"
+#      磁盘 49GB 剩余 / 源码已占 62GB / 需求侧写成 62+42=104GB  -> 必然误报"容量不足"
 #  正确做法：
-#    pre_sync  （sync 之前）: avail >= 预计源码 + swap + out   —— 源码还没占盘，要全额算
-#    post_sync （sync 之后）: avail >= swap + out 还需增量      —— 源码已占盘，只算增量
+#    pre_sync  （sync 之前）: avail >= 预计源码 + out   —— 源码还没占盘，要全额算
+#    post_sync （sync 之后）: avail >= out 还需增量      —— 源码已占盘，只算增量
 #
 #  AOSP 10 `--depth=1` 源码实测 62~63GB（AOSP_SOURCE_ESTIMATE_GB）。
+#
+#  【swap 在 pre_sync 阶段按 0 计】
+#  pre_sync 跑在 repo sync 之前，此刻 swap 文件还没创建，真实占用是未知的。
+#  而且 AOSP_SWAP_MODE=auto 的设计是"优先 zram（0 磁盘）/ 磁盘不够就不建文件"，
+#  把 16GB 记进需求等于假设了一个大概率不会发生的最坏情况，会白白拒掉本来能跑的构建。
+#  swap 的真实决策由后面的 create_swap 依据当时的 df 做自适应，守卫不重复预扣。
 # =============================================================================
 AOSP_SOURCE_ESTIMATE_GB="${AOSP_SOURCE_ESTIMATE_GB:-63}"
 
@@ -222,32 +287,23 @@ project_build_capacity() {
 
   local out; out="$(aosp_out)"
   local avail src_gb out_now_gb out_need swap_gb need_gb src_side
-  avail="$(df -BG --output=avail "$p" | tail -n1 | tr -dc '0-9')"
-  src_gb="$(du -BG --exclude=out "$AOSP_SRC_DIR" 2>/dev/null | cut -f1 | tr -dc '0-9' || echo 0)"
+  avail="$(avail_gb "$p")"
+  src_gb="$(du_gb "$AOSP_SRC_DIR" --exclude=out)"
 
-  # swap 文件是否已经落在同一分区上（已落盘则 df 的 avail 已含它，不能再重复计）
+  # swap：只有"已经落盘的文件"才计入；尚未创建的按 0 算（理由见文件头注释）
   swap_gb=0
-  if [ "${AOSP_SWAP_MODE:-auto}" != "zram" ] \
-     && ! { [ -e "$AOSP_SWAP_FILE" ] && swapon --show=NAME --noheadings 2>/dev/null | grep -Fxq "$AOSP_SWAP_FILE"; }; then
-    # 还没建：按将要占用的量预估
-    if [ -e "$AOSP_SWAP_FILE" ]; then
-      swap_gb="$(du -BG "$AOSP_SWAP_FILE" 2>/dev/null | cut -f1 | tr -dc '0-9' || echo 0)"
-    else
-      swap_gb="$AOSP_SWAP_SIZE_GB"
-    fi
+  if [ -e "$AOSP_SWAP_FILE" ]; then
+    swap_gb="$(du_gb "$AOSP_SWAP_FILE")"
   fi
 
   # out 满负荷估计 vs 现状，取增量
-  out_now_gb=0
-  if [ -d "$out" ]; then
-    out_now_gb="$(du -BG "$out" 2>/dev/null | cut -f1 | tr -dc '0-9' || echo 0)"
-  fi
+  out_now_gb="$(du_gb "$out")"
   out_need=$(( AOSP_OUT_ESTIMATE_GB - out_now_gb ))
   [ "$out_need" -lt 0 ] && out_need=0
 
   if [ "$phase" = "pre_sync" ]; then
     src_side=$AOSP_SOURCE_ESTIMATE_GB      # 源码还没落盘，全额计入需求
-    need_gb=$(( src_side + swap_gb + out_now_gb + out_need ))
+    need_gb=$(( src_side + out_now_gb + out_need ))
   else
     src_side=0                            # 源码已落盘，df 的 avail 里已经扣过了
     need_gb=$(( swap_gb + out_need ))
@@ -256,11 +312,11 @@ project_build_capacity() {
   log "  分区可用       : ${avail}GB"
   log "  AOSP 源码(实测): ${src_gb}GB"
   if [ "$phase" = "pre_sync" ]; then
-    log "  源码计入需求   : 是（${AOSP_SOURCE_ESTIMATE_GB}GB，尚未落盘）"
+    log "  源码计入需求   : 是（按估计 ${AOSP_SOURCE_ESTIMATE_GB}GB，尚未落盘）"
   else
     log "  源码计入需求   : 否（已落盘，已从 avail 中扣除）"
   fi
-  log "  swap 计入需求  : ${swap_gb}GB (mode=${AOSP_SWAP_MODE:-auto}; zram 不占盘)"
+  log "  swap 已落盘    : ${swap_gb}GB (mode=${AOSP_SWAP_MODE:-auto}; zram 不占盘)"
   log "  out 现状/估计  : ${out_now_gb}GB / ${AOSP_OUT_ESTIMATE_GB}GB  -> 还需 ${out_need}GB"
   log "  本阶段需求合计 : ${need_gb}GB"
 
@@ -270,7 +326,7 @@ project_build_capacity() {
     echo "source_measured_gb=${src_gb}"
     echo "source_estimate_gb=${AOSP_SOURCE_ESTIMATE_GB}"
     echo "source_counted_in_need=$([ "$phase" = pre_sync ] && echo yes || echo no)"
-    echo "swap_need_gb=${swap_gb}"
+    echo "swap_on_disk_gb=${swap_gb}"
     echo "out_now_gb=${out_now_gb}"
     echo "out_estimate_gb=${AOSP_OUT_ESTIMATE_GB}"
     echo "out_need_extra_gb=${out_need}"
@@ -293,7 +349,6 @@ project_build_capacity() {
   err "     已实测 ubuntu-22.04-large/2xlarge/4xlarge 在本账号不会被调度（一直 queued）"
   err "  3) 加 --prune-source 裁剪无关源码（每项约省 1~4GB，需自行确认不参与目标图）"
   err "  4) 调小 AOSP_OUT_ESTIMATE_GB（治标，会让 out 在编译途中写满而半残）"
-  err "  5) 调小 AOSP_SWAP_SIZE_GB（治标，会提高 OOM 风险）"
   if [ "${AOSP_FREE_SPACE_GUARD:-1}" = "1" ]; then
     err "守卫开启，直接终止。确认要冒险继续请设 AOSP_FREE_SPACE_GUARD=0（out 可能在编译中损坏）"
     exit 1

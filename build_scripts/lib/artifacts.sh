@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 # =============================================================================
 #  lib/artifacts.sh —— out 目录的跨 job 传递（分片 tar.zst）
 # -----------------------------------------------------------------------------
@@ -257,7 +257,7 @@ artifacts_unpack() {
   # zstd 压缩比按最差 1:1 估（保守），实际 AOSP out 通常 1:2.5~1:4
   local need_gb=$(( need_mb / 1024 + 6 ))
   local avail_gb
-  avail_gb="$(df -BG --output=avail "$(dirname "$dest")" | tail -n1 | tr -dc '0-9')"
+  avail_gb="$(avail_gb "$(dirname "$dest")")"
   log "分片压缩体积 ${need_mb}MB，保守估计需要 ${need_gb}GB，可用 ${avail_gb}GB"
   if [ "$avail_gb" -lt "$need_gb" ]; then
     die "剩余空间不足以解包 out（${avail_gb}GB < ${need_gb}GB）"

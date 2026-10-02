@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 # =============================================================================
 #  lib/reclaim_disk.sh —— 回收 GitHub 托管 runner 上的预装磁盘空间
 # -----------------------------------------------------------------------------
@@ -68,7 +68,7 @@ reclaim_runner_disk() {
   fi
 
   local before after
-  before="$(df -BG --output=avail / | tail -n1 | tr -dc '0-9')"
+  before="$(avail_gb /)"
   log "回收前可用: ${before}GB"
   df -hT / | tail -1
 
@@ -134,7 +134,7 @@ reclaim_runner_disk() {
     log "已清理 apt 包缓存（/var/lib/apt/lists 留到依赖安装完再清）"
   fi
 
-  after="$(df -BG --output=avail / | tail -n1 | tr -dc '0-9')"
+  after="$(avail_gb /)"
   freed=$(( after - before ))
   log "回收后可用: ${after}GB  (净回收 ${freed}GB)"
 

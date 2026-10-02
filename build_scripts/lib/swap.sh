@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 # =============================================================================
 #  lib/swap.sh —— 16G swap 准备
 # -----------------------------------------------------------------------------
@@ -132,7 +132,7 @@ create_swap() {
   # 只有磁盘足够容纳 swap 文件时才建，否则白白吃掉 16GB 磁盘。
   local dir; dir="$(dirname "$swapfile")"
   local avail
-  avail="$(df -BG --output=avail "$dir" 2>/dev/null | tail -n1 | tr -dc '0-9' || echo 0)"
+  avail="$(avail_gb "$dir")"
   local file_need=$(( size_gb + 2 ))
   log "当前 swap 总览:"
   swapon --show || true

@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 # =============================================================================
 #  lib/compile_shard.sh —— 带时间预算的 ninja 执行 + 完工判定
 # -----------------------------------------------------------------------------
@@ -48,7 +48,7 @@ build_with_budget() {
 
   banner "开始串行编译（预算 ${budget_min} 分钟，-j${AOSP_BUILD_JOBS}）"
   log "ninja   : $ninja"
-  log "目标清单: $rsp ($(wc -l < "$rsp") 个目标)"
+  log "目标清单: $rsp ($(count_lines "$rsp") 个目标)"
   log "预算    : ${budget_min} 分钟（到点优雅停止，工作量留给下一个 shard）"
   log "提示    : 进度可看本 job 日志，或 ninja 的 -d stats 输出"
 
@@ -75,7 +75,7 @@ build_with_budget() {
       log "编译中… 已用 $(( elapsed / 60 )) 分 / 预算 ${budget_min} 分（剩余 $(( (budget_min * 60 - elapsed) / 60 )) 分）"
       # 顺便报一下 out 当前体积，便于观察增长速率
       log "  out 体积: $(du -sh "$out" 2>/dev/null | cut -f1 || echo '?')"
-      log "  磁盘剩余: $(df -BG --output=avail "$out" 2>/dev/null | tail -n1 | tr -dc '0-9')GB"
+      log "  磁盘剩余: $(avail_gb "$out")GB"
     fi
 
     if [ "$elapsed" -ge $(( budget_min * 60 )) ]; then
@@ -157,12 +157,13 @@ is_build_complete() {
 
   # ninja 自己说的话（no work to do / warning / error）不算"待执行命令"
   #
-  # 注意：这里必须用 `|| true` 而不是 `|| echo 0`。
+  # 注意：绝对不能用 `grep -c ... || echo 0`。
   #   grep -c 在"匹配 0 行"时会打印 0 并返回退出码 1，
   #   `|| echo 0` 会再追加一行 0，得到 "0\n0" 这种两行字符串，
   #   后续整数比较会直接报语法错 —— 也就是说"全部完成"这个最关键的情况会失效。
+  # 统一走 common.sh 里的 count_lines（内部已处理退出码 + 数值白名单）。
   local real
-  real="$(grep -vE '^[[:space:]]*ninja:' "$dry" 2>/dev/null | grep -c '[^[:space:]]' || true)"
+  real="$(grep -vE '^[[:space:]]*ninja:' "$dry" 2>/dev/null | count_lines -)"
   case "$real" in
     ''|*[!0-9]*) real=0 ;;   # 空值/异常值一律当 0（无待执行命令）
   esac
