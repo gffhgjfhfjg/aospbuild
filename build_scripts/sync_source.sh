@@ -178,8 +178,10 @@ do_repo_sync() {
   cd "$AOSP_SRC_DIR"
   [ -d ".repo" ] || do_repo_init
 
-  # 空间守卫：sync 前就要检查
-  require_free_gb 30 "$AOSP_SRC_DIR"
+  # 空间守卫：sync 前就要检查。
+  # 用 pre_sync 阶段：此时源码还没落盘，必须把它全额算进需求
+  #   实测 AOSP 10 --depth=1 源码 62~63GB，回收磁盘后可用 ~112GB
+  project_build_capacity pre_sync "$AOSP_SRC_DIR"
 
   local sync_args=(
     -c                     # 只拉当前分支

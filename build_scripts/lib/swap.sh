@@ -31,6 +31,14 @@
 # =============================================================================
 
 # zram 设备初始化：返回 0 表示成功
+# -----------------------------------------------------------------------------
+# 关键点：不能只靠 `modprobe zram`。很多内核（尤其云厂商定制内核，如 GitHub
+# runner 的 6.8.0-*-azure）已经带 zram 但 num_devices=0，此时
+# /sys/block/zram0 根本不存在，modprobe 也不会创建设备。
+# 正确做法是走 sysfs 的 hot_add：
+#     echo 1 > /sys/class/zram-control/hot_add
+# 两条路径都试，并给出可诊断的失败原因。
+# -----------------------------------------------------------------------------
 setup_zram() {
   local size_gb="${1:-$AOSP_SWAP_SIZE_GB}"
   local dev="/dev/zram0"
@@ -43,25 +51,58 @@ setup_zram() {
 
   local SUDO=""
   [ "$(id -u)" -ne 0 ] && SUDO="sudo"
+  local why=""
 
-  # 内核模块
-  if ! lsmod 2>/dev/null | grep -q '^zram'; then
-    $SUDO modprobe zram num_devices=1 2>/dev/null || return 1
-    log "已加载 zram 模块"
+  # ---- 路径 1：sysfs hot_add（内核已支持 zram 时的标准做法）----
+  if [ -w /sys/class/zram-control/hot_add ] || [ -e /sys/class/zram-control/hot_add ]; then
+    if echo 1 | $SUDO tee /sys/class/zram-control/hot_add >/dev/null 2>&1; then
+      log "zram: 通过 /sys/class/zram-control/hot_add 创建设备"
+    else
+      why="${why} hot_add 写入失败;"
+    fi
+  else
+    why="${why} 无 /sys/class/zram-control（内核可能未启用 zram）;"
   fi
-  [ -e /sys/block/zram0 ] || { warn "zram0 设备未出现（内核未启用 zram）"; return 1; }
 
-  # 选压缩算法：优先 zstd(3)，退化 lz4(2)
+  # ---- 路径 2：modprobe（内核把 zram 做成可加载模块时）----
+  if [ ! -e /sys/block/zram0 ]; then
+    if $SUDO modprobe zram num_devices=1 2>/tmp/.zram_modprobe.err; then
+      log "zram: modprobe zram num_devices=1 成功"
+    else
+      why="${why} modprobe 失败: $(tr -d '\n' < /tmp/.zram_modprobe.err 2>/dev/null | cut -c1-80);"
+    fi
+  fi
+
+  if [ ! -e /sys/block/zram0 ]; then
+    why="${why} /sys/block/zram0 不存在;"
+    warn "zram 不可用：${why}"
+    warn "内核 zram 支持: $( [ -e /sys/class/zram-control ] && echo '有 zram-control 但没建出设备' || echo '无 zram-control' )"
+    warn "已加载模块: $(lsmod 2>/dev/null | grep -i zram || echo '无')"
+    return 1
+  fi
+
+  # ---- 压缩算法：优先 zstd(3)，退化 lz4(2) ----
   local algo_id=2 algo_name="lz4"
   if grep -qw zstd /sys/block/zram0/comp_algorithm 2>/dev/null; then
     algo_id=3; algo_name="zstd"
   fi
-  echo "$algo_id" | $SUDO tee /sys/block/zram0/comp_algorithm >/dev/null 2>&1 || return 1
+  if ! echo "$algo_id" | $SUDO tee /sys/block/zram0/comp_algorithm >/dev/null 2>&1; then
+    why="${why} 写 comp_algorithm 失败;"
+  fi
+  if ! echo "$(( size_gb * 1024 ))M" | $SUDO tee /sys/block/zram0/disksize >/dev/null 2>&1; then
+    why="${why} 写 disksize 失败;"
+  fi
+  if ! $SUDO mkswap "$dev" >/dev/null 2>&1; then
+    why="${why} mkswap 失败;"
+  fi
+  if ! $SUDO swapon "$dev" 2>/tmp/.zram_swapon.err; then
+    why="${why} swapon 失败: $(tr -d '\n' < /tmp/.zram_swapon.err 2>/dev/null | cut -c1-80);"
+  fi
 
-  echo "$(( size_gb * 1024 ))M" | $SUDO tee /sys/block/zram0/disksize >/dev/null 2>&1 || return 1
-
-  $SUDO mkswap "$dev" >/dev/null 2>&1 || return 1
-  $SUDO swapon "$dev" 2>/dev/null || return 1
+  if ! swapon --show=NAME --noheadings 2>/dev/null | grep -Fxq "$dev"; then
+    warn "zram 启用失败：${why}"
+    return 1
+  fi
 
   log "zram 就绪: ${dev}  压缩算法=${algo_name}  逻辑容量=${size_gb}GB（实际占用内存远小于此）"
   return 0
@@ -112,9 +153,30 @@ create_swap() {
       have_file=1
       ;;
     auto|*)
-      # auto：先建 zram（不占磁盘），再看磁盘是否宽裕决定要不要 swap 文件
-      setup_zram "$size_gb" && have_zram=1 || warn "zram 初始化失败"
-      if [ "$avail" -ge $(( file_need + ${AOSP_OUT_ESTIMATE_GB:-45} )) ]; then
+      # auto：先建 zram（不占磁盘，这是最优解）
+      setup_zram "$size_gb" && have_zram=1 || warn "zram 不可用，转而评估 swap 文件"
+      if [ "$have_zram" -eq 0 ]; then
+        # zram 拿不到时的策略：**先把 out 需要的空间留足，剩余才拿来做 swap。**
+        # 反过来做（先给 swap 16GB）会必然失败：
+        #   实测 磁盘剩 49GB / out 需 ~42GB —— 若再建 16GB swap，out 只剩 33GB，
+        #   容量守卫会直接判死。swap 是防 OOM 的保险，out 是编译的硬需求，
+        #   冲突时必须优先保 out。
+        local slack=$(( avail - AOSP_OUT_ESTIMATE_GB - 2 ))
+        [ "$slack" -lt 0 ] && slack=0
+        local wsize="$size_gb"
+        [ "$slack" -lt "$wsize" ] && wsize="$slack"
+        if [ "$wsize" -ge 2 ]; then
+          log "磁盘剩余 ${avail}GB，扣掉 out 需要的 ${AOSP_OUT_ESTIMATE_GB}GB 后仍可挤出 ${wsize}GB swap 文件"
+          have_file=1
+          size_gb="$wsize"
+        else
+          warn "磁盘剩余 ${avail}GB，扣掉 out 需要的 ${AOSP_OUT_ESTIMATE_GB}GB 后已无余量（slack=${slack}GB）"
+          warn "-> 不额外创建 swap。理由：swap 只是防 OOM 的保险，而 out 是编译硬需求；"
+          warn "   此时建 swap 只会把 out 挤死，容量守卫也会直接判死。"
+          warn "   runner 自带 15GiB 物理内存 + 3GiB 预置 swap，且 AOSP_BUILD_JOBS=1 串行编译"
+          warn "   同时只跑一个 clang/javac，内存压力远低于并行构建。"
+        fi
+      elif [ "$avail" -ge $(( file_need + ${AOSP_OUT_ESTIMATE_GB:-45} )) ]; then
         have_file=1
       else
         warn "磁盘剩余 ${avail}GB，容纳不下 ${file_need}GB swap 文件（要留给 out ${AOSP_OUT_ESTIMATE_GB:-45}GB）"
@@ -152,10 +214,18 @@ create_swap() {
   fi
 
   if [ "$have_zram" -eq 0 ] && [ "$have_file" -eq 0 ]; then
-    err "未能启用任何 swap！"
-    err "soong/javac 很可能在编译途中被 OOM Killer 杀掉（ninja exit 137 / Killed）。"
-    err "排查：'modprobe zram' 是否可用；'swapon --show' 是否有输出；'free -h' 是否显示 swap。"
-    exit 1
+    # 这里不 die：swap 只是防 OOM 的保险，不是编译的硬前置。
+    #   -j1 串行编译时同时只有一个 clang/javac 在跑，15GiB 内存 + 3GiB 预置 swap
+    #   通常够用；为这个保险把整条流水线挡死（run 36965845601 就是这样失败的）不划算。
+    # 真正决定成败的是 project_build_capacity 的磁盘守卫和 ninja 自身的内存表现。
+    warn "=========================================================="
+    warn " 未能额外启用 swap（zram 不可用 + 磁盘放不下 swap 文件）"
+    warn " 继续编译，但 OOM 风险上升。观察点："
+    warn "  1) ninja 退出码 137 或日志里出现 'Killed' = 被 OOM Killer 杀了"
+    warn "  2) 想加大保险：把 AOSP_SWAP_MODE 设为 file（强制 16G swap 文件，"
+    warn "     代价是 out 可用空间少 16GB，本就紧张的磁盘会更紧张）"
+    warn "  3) 或降 AOSP_OUT_ESTIMATE_GB 给 swap 腾空间"
+    warn "=========================================================="
   fi
 
   # ---- 内核参数 ----
