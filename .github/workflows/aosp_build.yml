@@ -1,4 +1,4 @@
-﻿# =============================================================================
+# =============================================================================
 #  AOSP 10 (android-10.0.0_r47) arm64 交叉编译 —— GitHub Actions 分段云端构建
 # -----------------------------------------------------------------------------
 #  目标产物 : aosp_arm64-eng  镜像 (system.img / vendor.img / odm.img / ...)
@@ -185,13 +185,20 @@ jobs:
           echo "runner : $(uname -a)"
           echo "cpu    : $(nproc)  mem: $(free -h | awk '/Mem:/{print $2}')"
           echo "--- df -h ---"; df -hT
-          echo "--- 提示：ubuntu-latest 只有一块 ~72GB SSD，AOSP 全量 + out 远超该容量 ---"
+          echo "--- 实测(ubuntu-22.04): 根卷 146G，回收预装软件后可用 ~112GB ---"
+          echo "--- AOSP 源码 63GB, 留给 out 约 49GB。详见 README「硬性容量约束」 ---"
           echo "--- 详细容量分析与可选项见 CI 仓库 README.md「硬性容量约束」章节 ---"
 
       - name: 'Checkout CI 仓库（只含 workflow / build_scripts / patches）'
         uses: actions/checkout@v7
         with:
           fetch-depth: 1
+
+      - name: 'CI 工程自检（BOM / shebang / bash -n / YAML）'
+        run: |
+          set -euo pipefail
+          chmod +x build_scripts/*.sh build_scripts/lib/*.sh
+          ./build_scripts/selfcheck.sh
 
       - name: '安装宿主依赖 + ARM64 交叉编译工具链'
         run: |
@@ -315,6 +322,12 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: 'CI 工程自检（BOM / shebang / bash -n / YAML）'
+        run: |
+          set -euo pipefail
+          chmod +x build_scripts/*.sh build_scripts/lib/*.sh
+          ./build_scripts/selfcheck.sh
+
       - name: '安装宿主依赖 + ARM64 交叉编译工具链'
         run: |
           set -euo pipefail
@@ -415,6 +428,12 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: 'CI 工程自检（BOM / shebang / bash -n / YAML）'
+        run: |
+          set -euo pipefail
+          chmod +x build_scripts/*.sh build_scripts/lib/*.sh
+          ./build_scripts/selfcheck.sh
+
       - name: '安装宿主依赖 + ARM64 交叉编译工具链'
         run: |
           set -euo pipefail
@@ -513,6 +532,12 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 1
+
+      - name: 'CI 工程自检（BOM / shebang / bash -n / YAML）'
+        run: |
+          set -euo pipefail
+          chmod +x build_scripts/*.sh build_scripts/lib/*.sh
+          ./build_scripts/selfcheck.sh
 
       - name: '安装宿主依赖 + ARM64 交叉编译工具链'
         run: |
@@ -614,6 +639,12 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 1
+
+      - name: 'CI 工程自检（BOM / shebang / bash -n / YAML）'
+        run: |
+          set -euo pipefail
+          chmod +x build_scripts/*.sh build_scripts/lib/*.sh
+          ./build_scripts/selfcheck.sh
 
       - name: '安装宿主依赖 + ARM64 交叉编译工具链'
         run: |
