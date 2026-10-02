@@ -61,11 +61,62 @@ fi
 
 ensure_repo_tool() {
   if ! command -v repo >/dev/null 2>&1; then
-    die "未找到 repo 工具。apt 装不上时请手动安装：
+    # 系统没有 repo 时，先尝试装官方 launcher
+    install_repo_launcher
+  fi
+  command -v repo >/dev/null 2>&1 || die "未找到 repo 工具。apt 装不上时手动安装：
   mkdir -p ~/bin && curl -fLo ~/bin/repo https://storage.googleapis.com/git-repo-downloads/repo
   chmod +x ~/bin/repo && export PATH=\$PATH:~/bin"
+  log "repo 路径  : $(command -v repo)"
+  log "repo 版本  : $(repo --version 2>&1 | head -n3 | tr '\n' ' ')"
+}
+
+# -----------------------------------------------------------------------------
+# repo 子命令参数能力探测
+# -----------------------------------------------------------------------------
+# 用法: filter_repo_args <init|sync> <参数...>   结果写入全局数组 REPO_ARGS
+#
+# 不同发行版的 repo 包版本差异很大（Ubuntu 22.04 = 2.17，24.04 = 2.36），
+# 某些新选项（如 --git-lfs / --retry-fetches）在老版本上直接
+# "no such option" 让命令失败。
+#
+# 关键：必须用对应子命令的 --help 来判定。
+#   repo init --help 里没有 --retry-fetches（那是 sync 的选项），
+#   如果拿 init 的 help 去校验 sync 参数，会把硬性要求的 --retry-fetches 误删。
+# -----------------------------------------------------------------------------
+REPO_ARGS=()
+filter_repo_args() {
+  local sub="$1"; shift
+  REPO_ARGS=()
+
+  local help_out
+  help_out="$(repo "$sub" --help 2>&1 || true)"
+  # 注意：repo 缺失或报错时 help_out 是 "command not found" 之类的错误串而非空串。
+  # 如果不校验就拿去 grep，会把所有选项全判为"不支持"而误删 —— 必须验证它真是 help。
+  if ! printf '%s\n' "$help_out" | grep -qiE 'usage|--[a-z]'; then
+    warn "无法获取有效的 repo ${sub} --help（repo 可能未正确安装），原样使用参数"
+    REPO_ARGS=("$@")
+    return 0
   fi
-  log "repo 版本: $(repo --version 2>&1 | head -n3 | tr '\n' ' ')"
+
+  local a opt dropped=0
+  for a in "$@"; do
+    case "$a" in
+      --*)
+        opt="$a"
+        if [[ "$a" == *=* ]]; then opt="${a%%=*}"; fi
+        if printf '%s\n' "$help_out" | grep -qF -- "$opt"; then
+          REPO_ARGS+=("$a")
+        else
+          warn "当前 repo 版本不支持 ${opt}，已从 ${sub} 参数中剔除"
+          dropped=1
+        fi
+        ;;
+      *) REPO_ARGS+=("$a") ;;   # -u/-b/-j 及其取值原样保留
+    esac
+  done
+  [ "$dropped" -eq 1 ] && log "剔除不兼容选项后 ${sub} 参数: ${REPO_ARGS[*]}"
+  return 0
 }
 
 # =============================================================================
@@ -97,13 +148,20 @@ do_repo_init() {
     -b "$AOSP_TAG"
     --depth="$AOSP_REPO_DEPTH"
     --no-repo-verify
-    --git-lfs
   )
   # 可选镜像加速
   if [ -n "$AOSP_MIRROR_MANIFEST" ]; then
     init_args=( -u "$AOSP_MIRROR_MANIFEST" -b "$AOSP_TAG" --depth="$AOSP_REPO_DEPTH" --no-repo-verify )
     log "使用镜像源: ${AOSP_MIRROR_MANIFEST}"
   fi
+  # AOSP 10 本身不用 git-lfs；按开关添加，且经能力探测后老 repo 会自动剔除
+  if [ "${AOSP_REPO_GIT_LFS:-0}" = "1" ]; then
+    init_args+=(--git-lfs)
+  fi
+
+  # 能力探测：剔除当前 repo 版本不认识的选项（Ubuntu 22.04 的 repo 2.17 缺 --git-lfs）
+  filter_repo_args init "${init_args[@]}"
+  init_args=("${REPO_ARGS[@]}")
 
   log "repo init ${init_args[*]}"
   retry 3 repo init "${init_args[@]}"
@@ -132,11 +190,28 @@ do_repo_sync() {
     --prune                # 清理已被 manifest 移除的分支，省磁盘
     --fail-fast
   )
-  # --force-sync 可选（AOSP_CCACHE 不适用，这里用于跳过本地改动检查）
+  # --force-sync 可选（丢弃源码树本地改动）
   if [ "${AOSP_REPO_FORCE_SYNC:-0}" = "1" ]; then
     sync_args+=(--force-sync)
     log "启用 --force-sync（会丢弃源码树本地改动）"
   fi
+
+  # 能力探测：剔除当前 repo 版本不认识的 sync 选项。
+  # 注意必须用 repo sync --help 判定（--retry-fetches 等选项只出现在 sync 的 help 里）
+  filter_repo_args sync "${sync_args[@]}"
+  sync_args=("${REPO_ARGS[@]}")
+  local has_retry=0 a2
+  for a2 in "${sync_args[@]}"; do
+    [ "${a2#--retry-fetches=}" != "$a2" ] && has_retry=1
+  done
+  if [ "$has_retry" -eq 0 ]; then
+    die "当前 repo 版本不支持 --retry-fetches（$(repo --version 2>&1 | head -n1)）。
+     抗网络抖动是硬性要求，必须安装官方 repo launcher：
+       mkdir -p ~/bin && curl -fLo ~/bin/repo https://storage.googleapis.com/git-repo-downloads/repo
+       chmod +x ~/bin/repo && export PATH=\$PATH:~/bin
+     （apt 的 repo 包在 Ubuntu 22.04 上只有 2.17，缺少该选项）"
+  fi
+  log "已确认 --retry-fetches 保留 ✓"
 
   log "repo sync ${sync_args[*]}"
   # repo sync 内部已有重试，这里再包一层针对 git 协议级失败的兜底

@@ -159,6 +159,9 @@ install_apt_deps() {
   # ---- 字符集 / 时区，避免 soong & metalava 输出乱码 ----
   locale_gen_utf8
 
+  # ---- repo launcher（apt 的 repo 包太老，必须用官方版）----
+  install_repo_launcher
+
   log "宿主依赖安装完成"
 }
 
@@ -226,6 +229,44 @@ setup_java11() {
     warn "未找到任何 java，AOSP 10 编译将失败（需要 JDK 11）"
   fi
   return 0
+}
+
+# =============================================================================
+# repo launcher 安装
+# -----------------------------------------------------------------------------
+#  必须装官方最新 launcher，不能用 apt 的 repo 包：
+#    Ubuntu 22.04 的 repo 包是 2.17（2020 年），缺 --git-lfs 等新选项，
+#    会直接 "repo: error: no such option: --git-lfs" 让 repo init 失败。
+#    Ubuntu 24.04 的更老（实测 2.36 但也没 --git-lfs？见 run 36948461975 的实际情况，
+#    无论如何官方 launcher 最稳）。
+#  官方安装方式：https://gerrit.googlesource.com/git-repo/+master/README.md
+# =============================================================================
+install_repo_launcher() {
+  local bindir="${1:-$HOME/bin}"
+  local url="https://storage.googleapis.com/git-repo-downloads/repo"
+
+  mkdir -p "$bindir" 2>/dev/null || true
+  [ -w "$bindir" ] || { warn "无法写入 ${bindir}，跳过 repo launcher 安装"; return 0; }
+
+  log "安装官方 repo launcher → ${bindir}/repo"
+  if ! curl -fsSL --retry 3 -o "${bindir}/repo.new" "$url"; then
+    warn "下载 repo launcher 失败（网络问题），回退到系统 repo"
+    rm -f "${bindir}/repo.new"
+    return 0
+  fi
+  chmod +x "${bindir}/repo.new"
+  mv -f "${bindir}/repo.new" "${bindir}/repo"
+
+  # 放到 PATH 最前面
+  case ":$PATH:" in
+    *":$bindir:"*) : ;;
+    *) export PATH="$bindir:$PATH" ;;
+  esac
+
+  local ver
+  ver="$("$bindir/repo" --version 2>&1 | head -n3 | tr '\n' ' ' || true)"
+  log "repo launcher 版本: ${ver}"
+  log "repo 路径: $(command -v repo)"
 }
 
 # =============================================================================

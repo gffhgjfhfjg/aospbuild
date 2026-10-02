@@ -92,6 +92,8 @@ env:
   AOSP_REPO_SYNC_JOBS: ${{ inputs.sync_jobs || '4' }}
   # repo sync 网络重试（硬性要求：--retry-fetches=3）
   AOSP_REPO_RETRY_FETCHES: '3'
+  # AOSP 10 不用 git-lfs；脚本还会对 repo 参数做能力探测（apt 的 repo 2.17 缺 --git-lfs）
+  AOSP_REPO_GIT_LFS: '0'
   # 浅克隆，显著降低 .git 体积（.repo 是唯一被缓存的目录）
   AOSP_REPO_DEPTH: '1'
 
