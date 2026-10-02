@@ -38,13 +38,25 @@ apply_all_patches() {
   cd "$root"
 
   # ---------- 收集补丁（自然排序保证 0001 -> 0002 顺序）----------
-  mapfile -t patches < <(find "$pdir" -maxdepth 1 -type f -name '*.patch' -print | LC_ALL=C sort)
+  # 忽略规则（两类踩过的坑）：
+  #   1) 文件名含 EXAMPLE/template/README/dotfile 的一律不当补丁处理
+  #   2) 内容里没有 "^--- a/" + "^+++ b/" 真 diff 头的，一律跳过而不是判失败
+  #      （曾经把一个"补丁模板"放进 patches/，它是给人看的说明文档不是 diff，
+  #        被 apply 之后直接 FAIL，把整条流水线打断）
+  mapfile -t patches < <(find "$pdir" -maxdepth 1 -type f -name '*.patch' -print \
+    | LC_ALL=C sort \
+    | grep -v -iE '(^|/)(readme|[0-9]+-example|.*template.*|.*\.bak)$')
+
   local n=${#patches[@]}
   if [ "$n" -eq 0 ]; then
-    log "补丁目录 ${pdir} 中没有 *.patch 文件"
+    log "补丁目录 ${pdir} 中没有可应用的 *.patch 文件"
+    # 提示一下是不是有被忽略的
+    local ignored
+    ignored="$(find "$pdir" -maxdepth 1 -type f -name '*.patch' -print | LC_ALL=C sort | tr '\n' ' ')"
+    [ -n "$ignored" ] && log "提示：以下 .patch 因命名规则被忽略: ${ignored}"
     return 0
   fi
-  log "发现 ${n} 个补丁，位于 ${pdir}"
+  log "发现 ${n} 个待应用补丁，位于 ${pdir}"
 
   # ---------- 工具依赖 ----------
   if ! command -v patch >/dev/null 2>&1; then
@@ -56,6 +68,7 @@ apply_all_patches() {
   local applied=0
   local already=0
   local failed=0
+  local skipped_nondiff=0
   local failed_list=()
 
   local p
@@ -63,6 +76,13 @@ apply_all_patches() {
     local rel
     rel="$(basename "$p")"
     logv "----- 应用 ${rel} -----"
+
+    # ---- 有效性检查：必须是真 diff（至少一组 ^--- a/ 与 ^+++ b/）----
+    if ! grep -qE '^--- a/' "$p" || ! grep -qE '^\+\+\+ b/' "$p"; then
+      warn "  [SKIP] ${rel}（不含 a/ b/ diff 头，按说明文档跳过）"
+      skipped_nondiff=$((skipped_nondiff+1))
+      continue
+    fi
 
     # --forward：只往后打，绝不反向改写
     # --batch  ：非交互
@@ -97,7 +117,7 @@ apply_all_patches() {
     rm -f "$pout"
   done
 
-  log "补丁应用统计: applied=${applied}, already=${already}, failed=${failed}"
+  log "补丁应用统计: applied=${applied}, already=${already}, skipped_non_diff=${skipped_nondiff}, failed=${failed}"
 
   if [ "$failed" -gt 0 ]; then
     err "以下补丁应用失败: ${failed_list[*]}"

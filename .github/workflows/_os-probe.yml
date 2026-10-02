@@ -3,46 +3,56 @@ name: _os-probe
 # 仅手动触发的环境探针，不参与 main 推送的自动构建
 on:
   workflow_dispatch:
+    inputs:
+      probe:
+        description: 'what to probe'
+        required: false
+        default: 'disk'
 
 permissions:
   contents: read
 
 jobs:
   probe:
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 5
-    strategy:
-      fail-fast: false
-      matrix:
-        # 同时探测 latest 与 22.04，方便对比
-        os: [ubuntu-latest, ubuntu-22.04]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
     steps:
       - name: 环境信息
         run: |
           set -euo pipefail
-          echo "### RUNNER_IMAGE=${RUNNER_IMAGE:-unknown}"
-          echo "### OS_RELEASE"
-          cat /etc/os-release
-          echo "### KERNEL"
-          uname -a
-          echo "### CPU/MEM"
-          nproc; free -h
-          echo "### DISK"
-          df -hT
+          echo "### OS"
+          grep -E 'PRETTY_NAME|VERSION_ID' /etc/os-release
           echo "### TOOLCHAIN"
-          for c in gcc g++ clang python python3 java zstd tar; do
+          for c in gcc g++ clang python3 java; do
             printf '%-8s : ' "$c"
-            command -v "$c" >/dev/null 2>&1 && ("$c" --version 2>&1 | head -n1) || echo "NOT FOUND"
+            ("$c" --version 2>&1 | head -n1) || echo "NOT FOUND"
           done
-          echo "### KEY 32BIT LIBS (AOSP10 硬依赖)"
-          for p in lib32z1 lib32ncurses5 lib32readline-dev libtinfo5 zlib1g-dev:i386 \
-                   libssl-dev:i386 libc6-dev-i386 pngcrush schedtool squashfs-tools \
-                   python-is-python3 openjdk-11-jdk openjdk-8-jdk libiostream-dev; do
-            printf '%-24s : ' "$p"
-            dpkg-query -W -f='${Status} ${Version}\n' "$p" 2>/dev/null || echo "NOT INSTALLED"
+          echo "### DISK TOTAL"
+          df -hT /
+
+      - name: 磁盘占用 TOP 30（找可回收的肥肉）
+        run: |
+          set -euo pipefail
+          echo "### TOP-LEVEL / (du, 1 level)"
+          sudo du -x -h -d1 / 2>/dev/null | sort -h | tail -30
+          echo
+          echo "### TOP-LEVEL /home/runner"
+          du -x -h -d1 /home/runner 2>/dev/null | sort -h | tail -20
+          echo
+          echo "### KNOWN RECLAIMABLE CANDIDATES"
+          for p in /usr/local/lib/android /opt/hostedtoolcache /opt/ghc \
+                   /usr/share/dotnet /usr/local/share/boost /usr/local/graalvm \
+                   /usr/share/swift /opt/azcmt-agent /opt/pipx /usr/local/lib/node_modules; do
+            if [ -e "$p" ]; then
+              printf '%-34s ' "$p"
+              sudo du -x -sh "$p" 2>/dev/null | cut -f1
+            fi
           done
-          echo "### apt 可用性"
-          for p in lib32z1 lib32ncurses5 libtinfo5 pngcrush openjdk-11-jdk libiostream-dev; do
-            printf '%-20s : ' "$p"
-            apt-cache policy "$p" 2>/dev/null | sed -n '2p' | tr -d ' ' || echo "N/A"
-          done
+          echo
+          echo "### ANDROID ENV"
+          env | grep -iE 'android|sdk|java_home' || echo "(no ANDROID_* env)"
+          echo
+          echo "### DISK AFTER CANDIDATE RECLAIM (dry run, nothing deleted)"
+          before=$(df -BG --output=avail / | tail -n1 | tr -dc '0-9')
+          echo "avail_before_GB=$before"
+          echo "(未真实删除，仅统计；真实回收在 prepare_runner.sh 的 reclaim_runner_disk)"
