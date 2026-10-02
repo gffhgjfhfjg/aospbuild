@@ -197,14 +197,23 @@ project_build_capacity() {
   local p="${1:-$AOSP_SRC_DIR}"
   local avail src_gb swap_gb out_gb need_gb
   avail="$(df -BG --output=avail "$p" | tail -n1 | tr -dc '0-9')"
-  src_gb="$(du -BG --exclude=out --exclude=.repo "$AOSP_SRC_DIR" 2>/dev/null | cut -f1 | tr -dc '0-9' || echo 0)"
-  swap_gb="$AOSP_SWAP_SIZE_GB"
+  # 源码体积要算完整的（含 .repo/.git），因为它们同样占磁盘。
+  # AOSP 10 --depth=1 实测：工作区+ .repo 合计约 62GB。
+  src_gb="$(du -BG --exclude=out "$AOSP_SRC_DIR" 2>/dev/null | cut -f1 | tr -dc '0-9' || echo 0)"
+  # zram 模式不占磁盘，file/both 模式才要计入
+  if [ "${AOSP_SWAP_MODE:-auto}" = "zram" ]; then
+    swap_gb=0
+  elif [ -e "$AOSP_SWAP_FILE" ] && swapon --show=NAME --noheadings 2>/dev/null | grep -Fxq "$AOSP_SWAP_FILE"; then
+    swap_gb=0     # 已经在 AOSP_SRC_DIR 所在盘，df 的 avail 已经算进去了
+  else
+    swap_gb="$AOSP_SWAP_SIZE_GB"
+  fi
   out_gb="$AOSP_OUT_ESTIMATE_GB"
   need_gb=$(( src_gb + swap_gb + out_gb ))
 
   log "  分区可用     : ${avail}GB"
-  log "  AOSP 源码    : ${src_gb}GB"
-  log "  swap 文件    : ${swap_gb}GB"
+  log "  AOSP 源码    : ${src_gb}GB (含 .repo/.git，不含 out)"
+  log "  swap 文件    : ${swap_gb}GB (mode=${AOSP_SWAP_MODE:-auto}, zram 不占盘)"
   log "  out 预估     : ${out_gb}GB"
   log "  合计需要     : ${need_gb}GB"
 
@@ -224,10 +233,12 @@ project_build_capacity() {
   local gap=$(( need_gb - avail ))
   err "容量不足：缺 ${gap}GB"
   err "按影响从大到小的处理顺序："
-  err "  1) 换大磁盘 runner（唯一根治方案，README 第四章）"
-  err "  2) 把 AOSP_OUT_ESTIMATE_GB 调小并开启更多 --prune-source 项（省 5~15GB 源码）"
-  err "  3) 把 AOSP_SWAP_SIZE_GB 从 16 调小（swap 占的是同一块盘）"
-  err "     注意：调小 swap 会提高 OOM 风险（runner 只有 15GB 物理内存）"
+  err "  1) 确认 AOSP_RECLAIM_DISK=1 —— 回收预装的 Android SDK/dotnet/swift 可省 ~22GB"
+  err "     （未回收时 runner 只有 87GB，减去 62GB 源码后只剩 25GB，装不下 out）"
+  err "  2) 换大磁盘 runner：self-hosted（本仓库 runs-on 已参数化，改一处即可）"
+  err "     已实测 ubuntu-22.04-large/2xlarge/4xlarge 在本账号不会被调度（一直 queued）"
+  err "  3) 加 --prune-source 裁剪无关源码（每项约省 1~4GB，需自行确认不参与目标图）"
+  err "  4) 调小 AOSP_OUT_ESTIMATE_GB（治标，会让 out 在编译途中写满而半残）"
   if [ "${AOSP_FREE_SPACE_GUARD:-1}" = "1" ]; then
     err "守卫开启，直接终止。确认要冒险继续请设 AOSP_FREE_SPACE_GUARD=0（out 可能在编译中损坏）"
     exit 1

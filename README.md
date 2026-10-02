@@ -30,7 +30,7 @@ aosp-ci/                                  # CI 仓库根目录（就是 GitHub �
 │       └── aosp_build.yml                # ★ 唯一的工作流定义：4 个串行 job
 │
 ├── build_scripts/
-│   ├── prepare_runner.sh                 # runner 环境准备总入口（依赖 / swap）
+│   ├── prepare_runner.sh                 # runner 环境准备总入口（磁盘回收/依赖/swap）
 │   ├── sync_source.sh                    # Job1 主体：repo sync + 预处理
 │   ├── stage1_build.sh                   # ★ Job2 主体：-j1 编译（排除 metalava）
 │   ├── stage2_metalava.sh                # ★ Job3 主体：metalava 串行专项
@@ -38,8 +38,9 @@ aosp-ci/                                  # CI 仓库根目录（就是 GitHub �
 │   ├── apply_patches.sh                  # 补丁便捷入口（list / dry-run / apply / howto）
 │   └── lib/
 │       ├── common.sh                     # 严格模式、日志、ERR 陷阱、重试、lunch、磁盘守卫
-│       ├── apt_deps.sh                   # 宿主依赖 + ARM64 交叉编译工具链安装与自检
-│       ├── swap.sh                       # 16G swap 创建
+│       ├── apt_deps.sh                   # 宿主依赖 + ARM64 交叉工具链 + 官方 repo launcher + JDK11
+│       ├── swap.sh                       # 16G swap（zram 优先，不占磁盘）
+│       ├── reclaim_disk.sh               # 回收 runner 预装的 Android SDK 等 ~22GB
 │       ├── fix_python_shebang.sh         # Ubuntu 22.04 python shebang 修复
 │       ├── prune_device_trees.sh         # 删除 crosshatch / bonito 设备树
 │       ├── apply_patches.sh              # 批量 apply 补丁（被 sync_source.sh source）
@@ -47,9 +48,13 @@ aosp-ci/                                  # CI 仓库根目录（就是 GitHub �
 │       ├── artifacts.sh                  # out 目录分片 tar.zst 打包 / 解包 / 裁剪
 │       └── print_patch_howto.sh          # 打印补丁编写指南（独立入口）
 │
-├── patches/                              # AOSP 源码补丁（只有 .patch 文件）
-│   ├── README.md                         # 补丁编写与导出规范
-│   └── 0000-EXAMPLE-template.patch       # 补丁模板（复制起点）
+├── patches/                              # AOSP 源码补丁（只有真 .patch 文件）
+│   └── README.md                         # 补丁编写与导出规范（含模板内容）
+│
+├── .github/workflows/
+│   ├── aosp_build.yml                    # ★ 唯一的工作流定义：4 个串行 job
+│   ├── _os-probe.yml                     # 手动触发：runner 规格 / 磁盘占用探测
+│   └── _runner-avail.yml                 # 手动触发：哪些 runner label 真的可用
 │
 ├── .gitignore                            # 忽略本地调试产物
 └── README.md                             # 本文件
@@ -214,37 +219,80 @@ export AOSP_SRC_DIR=/data/aosp        # 换成本机路径
 
 ## 四、硬性容量约束（务必先读）
 
-> **GitHub 托管 runner 整机只有一块 ~72GB SSD、14GB 物理内存。**
-> AOSP 10 浅克隆后源码约 **60~90GB**，`out` 目录全量约 **40~80GB**，再加 16G swap
-> —— **物理上装不下**。本流水线已做最大化压缩，但仍建议按下面顺序处理。
+> **以下全部是 `ubuntu-22.04` 托管 runner 的实测数据（2026-10-02，image 20260927.309），
+> 不是估算。**
+
+| 项目 | 实测值 |
+|------|--------|
+| 整机磁盘 | `/dev/root ext4 146G`，已用 59G，**可用 87G**（只有这一个卷） |
+| 内存 / CPU | 15GiB RAM（预置 3GiB swap）/ 4 核 |
+| `/mnt` | **root 拥有，runner 用户不可写**（不要往这儿放东西） |
+| AOSP 10 源码（`repo sync --depth=1 -c --prune`） | **~62GB** |
+| 回收预装软件前剩余 | 87 − 62 = **25GB** ❌ |
+| `aosp_arm64-eng` 的 out 需要 | **30~50GB** |
+| runner 上可回收的预装软件 | **~22GB** |
+| 回收后剩余（109 − 62） | **47GB** ✅ |
+
+### 磁盘回收（`build_scripts/lib/reclaim_disk.sh`，`AOSP_RECLAIM_DISK=1` 默认开启）
+
+不做这一步就**必然**装不下。实测可回收：
+
+| 目录 | 大小 | 说明 |
+|------|------|------|
+| `/usr/local/lib/android` | **11.0G** | 预装 Android SDK + 3 个 NDK；AOSP 从源码编译用的是自己的 `prebuilts/ndk`，完全用不到 |
+| `/usr/share/dotnet` | 5.8G | .NET SDK |
+| `/usr/share/swift` | 3.5G | Swift 工具链 |
+| `/usr/local/lib/node_modules` | 1.2G | 全局 npm 包 |
+| `/opt/pipx` | 456M | pipx |
+| `/opt/hostedtoolcache` | 5.2G | **只清历史 node 版本，绝不整个删** —— actions 的 Post 步骤还要从这里取 node/python |
+
+删除 `/usr/local/lib/android` 后会一并 `unset` `ANDROID_HOME` / `ANDROID_SDK_ROOT` /
+`ANDROID_NDK_*` 并写入 `$GITHUB_ENV`。
+**这一步不能省**：留着悬空的 `ANDROID_NDK_HOME` 比没有这个变量更容易让 soong 崩。
+
+### 16G swap 为什么用 zram 而不是 swap 文件（`build_scripts/lib/swap.sh`）
+
+47GB 要留给 out，16G swap 文件等于吃掉三分之一；而 runner 只有 15GB 内存，本就有 OOM 风险。
+zram 是内存里的压缩块设备：逻辑容量同样是 16GB、同样受 `vm.swappiness` 控制，
+但匿名页用 lz4/zstd 压缩（典型 2.5~4:1），**实际只吃 4~7GB 物理内存且完全不占磁盘**。
+`AOSP_SWAP_MODE`：`auto`（默认，磁盘够就 zram+file 都开）/`zram`/`file`/`both`/`none`。
+
+### 已验证不可行的方案
+
+| 方案 | 实测结果 |
+|------|----------|
+| `ubuntu-latest` | 已是 **Ubuntu 24.04.5**（gcc 13.3 / Python 3.12 / JDK 17）→ AOSP 10 编不过（见 workflow 顶部说明） |
+| `ubuntu-22.04-large` / `2xlarge` / `4xlarge` | **不会被调度**，job 一直 `queued` 且 `runner_name` 为空（本账号未启用 larger runners） |
+| 只靠 `--prune-source` 补磁盘缺口 | 缺口 20~30GB，裁剪最多省 5~10GB，不够 |
 
 ### 已内置的省空间措施
 
 | 措施 | 位置 | 效果 |
 |------|------|------|
-| `repo sync --depth=1 -c --prune --no-clone-bundle` | `sync_source.sh` | 源码少 30~50% |
-| `python-is-python3` + shebang 改写 | `apt_deps.sh` / `fix_python_shebang.sh` | 兼容 Ubuntu 22.04，不影响体积 |
+| 回收预装 Android SDK / dotnet / swift | `reclaim_disk.sh` | **+22GB** |
+| zram 替代 16G swap 文件 | `swap.sh` | **+16GB** |
+| `repo sync --depth=1 -c --prune --no-clone-bundle` | `sync_source.sh` | 源码 110GB → 62GB |
 | `device/google`（含 crosshatch/bonito）删除 | `prune_device_trees.sh` | 省 3~6GB |
-| `cts` 目录删除 | `sync_source.sh --prune-source` | 省 2~4GB |
-| out slim 裁剪 | `artifacts.sh` | 上传体积降 40~70% |
+| `cts` 目录删除 + 注释其 soong namespace | `sync_source.sh --prune-source` | 省 2~4GB |
+| out slim 裁剪（只影响上传，不影响本地编译） | `artifacts.sh` | 上传体积降 40~70% |
 | `repo repack -ad --depth=50` | `sync_source.sh --repack` | `.repo` 体积降 20~40% |
-| 16G swap 放 `/mnt/aosp.swap` | `swap.sh` | 与 `out` 同分区，避免撑爆第二块卷 |
+| 编译前容量预估守卫 | `common.sh` `project_build_capacity` | 磁盘不够时**提前失败**并给出可执行建议，而不是让 out 写坏 |
 
-### 调优步骤
+### 容量守卫行为
 
-1. **确认最大可用分区**（Job 开头已打印 `df -hT`），把 `AOSP_SRC_DIR` 改到剩余空间最大的挂载点。
-2. **开启源码裁剪**：在 workflow 的 Job1「可选：裁剪」步骤已默认执行。
-   如需更多裁剪，在 workflow `env` 里加：
-   ```yaml
-   AOSP_PRUNE_SOURCE_EXTRA: 'external/mesa3d prebuilts/android-emulator'
-   ```
-   > 每加一项都必须确认**不参与 `aosp_arm64` 目标图**，否则 soong 会在构建图阶段报缺目录。
-3. **`.repo` 缓存超 10GB 时**：确认 `AOSP_REPO_DEPTH=1`、`.repo/projects` 无历史累积。
-   缓存超限时 `actions/cache` 会保存失败并给 warning，流水线仍能继续，只是慢。
-4. **如果仍装不下 —— 换 runner（强烈推荐）**：
-   把 `runs-on: ubuntu-latest` 改为自托管 runner，或用
-   `runs-on: ubuntu-latest` + 第三方大容量 runner label。
-   4 段串行 job 的设计对 runner 内存/磁盘/时长都没有硬绑定，迁移只需改 `runs-on`。
+`AOSP_FREE_SPACE_GUARD=1`（默认）时，Job2 编译前会：
+
+```
+  分区可用     : 109GB
+  AOSP 源码    : 62GB (含 .repo/.git，不含 out)
+  swap 文件    : 0GB (mode=auto, zram 不占盘)
+  out 预估     : 42GB
+  合计需要     : 104GB
+容量充足（余量 5GB）✓
+```
+
+余量不足则**直接终止**并按影响从大到小打印建议。确实要冒险继续时设
+`AOSP_FREE_SPACE_GUARD=0`（`out` 可能在编译途中因磁盘写满而半残）。
 
 ### 4 段串行带来的固定开销
 

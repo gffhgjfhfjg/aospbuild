@@ -42,8 +42,15 @@ if [ "$do_deps" -eq 0 ] && [ "$do_swap" -eq 0 ]; then do_deps=1; do_swap=1; fi
 source "${_here}/lib/apt_deps.sh"
 # shellcheck source=lib/swap.sh
 source "${_here}/lib/swap.sh"
+# shellcheck source=lib/reclaim_disk.sh
+source "${_here}/lib/reclaim_disk.sh"
 
 start_logging "prepare_runner"
+
+# 磁盘回收必须最先做 —— 后面每一步（AOSP 62GB 源码 + out 40GB）都靠这多出来的 22GB
+if [ "$do_deps" -eq 1 ]; then
+  reclaim_runner_disk
+fi
 
 if [ "$do_deps" -eq 1 ]; then
   install_apt_deps all

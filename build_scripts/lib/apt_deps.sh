@@ -163,6 +163,14 @@ install_apt_deps() {
   install_repo_launcher
 
   log "宿主依赖安装完成"
+
+  # ---- 依赖装完后清 apt 缓存（reclaim 阶段故意留着 lists 给这里用）----
+  local SUDO2=""
+  [ "$(id -u)" -ne 0 ] && SUDO2="sudo"
+  $SUDO2 apt-get clean >/dev/null 2>&1 || true
+  $SUDO2 rm -rf /var/lib/apt/lists/* 2>/dev/null || true
+  log "已清理 apt lists 与包缓存"
+  df -hT / | tail -1
 }
 
 # python3 别名兜底：apt 装不上 python-is-python3 时手工建软链

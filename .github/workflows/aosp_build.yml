@@ -109,18 +109,27 @@ env:
   AOSP_STAGE3_IMAGE_TARGETS: 'systemimg vendorimg odmimg productimg ramdisk userdataimg vbmetaimg'
 
   # --- 资源 ---
-  #  runner 实测规格（ubuntu-22.04, 2026-09 image）:
+  #  runner 实测规格（ubuntu-22.04, image 20260927.309, 2026-10-02）:
   #    CPU 4 核 / RAM 15GiB / 预置 swap 3GiB
-  #    磁盘: /dev/root ext4 146G，已用 59G，可用 ~87G（只有这一个卷，/mnt 不可写）
+  #    磁盘: /dev/root ext4 146G，已用 59G，可用 87G（只有这一个卷，/mnt 不可写）
+  #  已实测: AOSP 10 repo sync --depth=1 占用 ~62GB
+  #  已实测: larger runner (ubuntu-22.04-large/2xlarge/4xlarge) 在本账号不会被调度（一直 queued）
+  #
+  #  磁盘回收（lib/reclaim_disk.sh）—— 不做就一定装不下：
+  #    87GB - 62GB 源码 = 25GB，而 out 需要 30~50GB
+  #    回收预装的 Android SDK(11G) / dotnet(5.8G) / swift(3.5G) 等 ~22GB
+  #    => 109GB - 62GB = 47GB 给 out，可行
+  AOSP_RECLAIM_DISK: '1'
+  AOSP_RECLAIM_TOOLCACHE_GB: '4'       # hostedtoolcache 超此值才清历史 node 版本（绝不整个删）
   AOSP_SWAP_SIZE_GB: '16'               # 硬性要求：16G swap
   AOSP_SWAP_FILE: '/home/runner/aosp.swap'
   # auto = 优先 zram(内存压缩盘，不占磁盘)，磁盘宽裕时再加 swap 文件。
-  #        87GB 要同时装 AOSP 源码 + out，16G swap 文件会直接吃掉 19% 的可用空间。
+  #        47GB 要留给 out，16G swap 文件会直接吃掉三分之一。
   AOSP_SWAP_MODE: 'auto'
   AOSP_ENABLE_SWAP: '1'
   AOSP_FREE_SPACE_GB: '40'              # 开工前剩余空间不足该值则直接失败
   # 编译前容量预估：源码实测 + swap + out 预估，超过可用空间则提前失败并给出建议
-  AOSP_OUT_ESTIMATE_GB: '45'            # aosp_arm64-eng 全量 out 的保守估计
+  AOSP_OUT_ESTIMATE_GB: '42'            # aosp_arm64-eng 全量 out 的保守估计
   AOSP_FREE_SPACE_GUARD: '1'            # 1=启用预估守卫, 0=只打印警告
 
   # --- out 目录跨 job 传递 ---
