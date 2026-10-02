@@ -1,4 +1,4 @@
-# =============================================================================
+﻿# =============================================================================
 #  AOSP 10 (android-10.0.0_r47) arm64 交叉编译 —— GitHub Actions 分段云端构建
 # -----------------------------------------------------------------------------
 #  目标产物 : aosp_arm64-eng  镜像 (system.img / vendor.img / odm.img / ...)
@@ -49,6 +49,26 @@ concurrency:
 permissions:
   contents: read
 
+# -----------------------------------------------------------------------------
+#  Runner 版本说明（重要，不要盲目改成 ubuntu-latest）
+# -----------------------------------------------------------------------------
+#  实测结论（2026-10-02，runner-images 20260927）：
+#    ubuntu-latest  = Ubuntu 24.04.5  gcc 13.3 / clang 18 / Python 3.12 / Java 17
+#    ubuntu-22.04   = Ubuntu 22.04.5  gcc 11.4 / clang 14 / Python 3.10 / Java 11
+#
+#  AOSP 10 必须在 22.04 上编译，原因：
+#    1) Python 3.12 移除了 distutils，build/make、build/soong、external/* 里的
+#       python 工具会直接 ModuleNotFoundError 崩掉
+#    2) gcc 13 对 AOSP 10 的 host 模块 (-Werror) 会报出一批新告警直接失败
+#    3) AOSP 10 要求 JDK 11，24.04 默认 JDK 17
+#
+#  而且 GitHub 官方公告：ubuntu-latest 将在 2026-10-19 迁移到 Ubuntu 26。
+#  所以这里用 vars.AOSP_RUNNER_OS（仓库级 Variable，可不改代码切换），
+#  默认硬编码到 ubuntu-22.04，不随 latest 漂移。
+#  要切换时：Settings → Secrets and variables → Actions → Variables
+#            新建 AOSP_RUNNER_OS = ubuntu-22.04
+# --------------------------------------------------------------------------
+
 # ------------------------------------------------------------- 默认 shell -----
 defaults:
   run:
@@ -61,8 +81,11 @@ env:
   AOSP_MANIFEST_URL: 'https://android.googlesource.com/platform/manifest'
   # 可选：走国内镜像加速，留空则用官方源。例如 https://mirrors.tuna.tsinghua.edu.cn/git/android-platform-manifest
   AOSP_MIRROR_MANIFEST: ''
-  # AOSP 源码目录。ubuntu-latest 上 /mnt 所在卷剩余空间通常比 / 多，优先放 /mnt
-  AOSP_SRC_DIR: '/mnt/aosp'
+  # AOSP 源码目录。
+  #   注意：GitHub runner 上 /mnt 由 root 拥有，runner 用户无权 mkdir，
+  #   所以不能用 /mnt/aosp（实测 Permission denied）。整块盘只有一个 ext4 根卷，
+  #   任何路径的可用空间都一样，因此放在 $HOME 下即可。
+  AOSP_SRC_DIR: '/home/runner/aosp'
   # 目标产品/变体
   AOSP_LUNCH_TARGET: 'aosp_arm64-eng'
   AOSP_OUT_PRODUCT_DIR: 'arm64'          # out/target/product/arm64
@@ -84,10 +107,19 @@ env:
   AOSP_STAGE3_IMAGE_TARGETS: 'systemimg vendorimg odmimg productimg ramdisk userdataimg vbmetaimg'
 
   # --- 资源 ---
+  #  runner 实测规格（ubuntu-22.04, 2026-09 image）:
+  #    CPU 4 核 / RAM 15GiB / 预置 swap 3GiB
+  #    磁盘: /dev/root ext4 146G，已用 59G，可用 ~87G（只有这一个卷，/mnt 不可写）
   AOSP_SWAP_SIZE_GB: '16'               # 硬性要求：16G swap
-  AOSP_SWAP_FILE: '/mnt/aosp.swap'
-  AOSP_FREE_SPACE_GB: '40'              # 开工前剩余空间不足该值则直接失败，避免编译中途磁盘写满
+  AOSP_SWAP_FILE: '/home/runner/aosp.swap'
+  # auto = 优先 zram(内存压缩盘，不占磁盘)，磁盘宽裕时再加 swap 文件。
+  #        87GB 要同时装 AOSP 源码 + out，16G swap 文件会直接吃掉 19% 的可用空间。
+  AOSP_SWAP_MODE: 'auto'
   AOSP_ENABLE_SWAP: '1'
+  AOSP_FREE_SPACE_GB: '40'              # 开工前剩余空间不足该值则直接失败
+  # 编译前容量预估：源码实测 + swap + out 预估，超过可用空间则提前失败并给出建议
+  AOSP_OUT_ESTIMATE_GB: '45'            # aosp_arm64-eng 全量 out 的保守估计
+  AOSP_FREE_SPACE_GUARD: '1'            # 1=启用预估守卫, 0=只打印警告
 
   # --- out 目录跨 job 传递 ---
   # slim = 裁掉可再生的中间物（obj/PACKAGES、obj/SOURCES、install staging 目录），
@@ -123,7 +155,7 @@ jobs:
   # ===========================================================================
   sync_source:
     name: '1/4 sync_source (repo sync + 工具链 + 补丁)'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.AOSP_RUNNER_OS || 'ubuntu-22.04' }}
     timeout-minutes: 300
     environment: aosp-build          # 便于在仓库 Settings -> Environments 加审批与计费归类
 
@@ -138,7 +170,7 @@ jobs:
           echo "--- 详细容量分析与可选项见 CI 仓库 README.md「硬性容量约束」章节 ---"
 
       - name: 'Checkout CI 仓库（只含 workflow / build_scripts / patches）'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 1
 
@@ -155,7 +187,7 @@ jobs:
 
       - name: '恢复 .repo 缓存（仅 .repo，out 永不进 cache）'
         if: env.CACHE_REPO_ENABLED == 'true'
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: ${{ env.CACHE_REPO_PATH }}
           key: ${{ env.CACHE_REPO_KEY_PREFIX }}-${{ runner.os }}-${{ env.AOSP_TAG }}-${{ env.AOSP_REPO_DEPTH }}-${{ github.sha }}
@@ -195,7 +227,7 @@ jobs:
 
       - name: '保存 .repo 缓存'
         if: env.CACHE_REPO_ENABLED == 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: ${{ env.CACHE_REPO_PATH }}
           key: ${{ env.CACHE_REPO_KEY_PREFIX }}-${{ runner.os }}-${{ env.AOSP_TAG }}-${{ env.AOSP_REPO_DEPTH }}-${{ github.sha }}
@@ -217,7 +249,7 @@ jobs:
 
       - name: '上传 Job1 日志（失败也上传）'
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: logs-1-sync_source
           path: |
@@ -234,7 +266,7 @@ jobs:
   build_stage1:
     name: '2/4 build_stage1 (-j1 全量编译，排除 metalava)'
     needs: sync_source
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.AOSP_RUNNER_OS || 'ubuntu-22.04' }}
     timeout-minutes: 300
     environment: aosp-build
 
@@ -245,7 +277,7 @@ jobs:
           df -hT; free -h; nproc
 
       - name: 'Checkout CI 仓库'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 1
 
@@ -257,7 +289,7 @@ jobs:
 
       - name: '恢复 .repo 缓存（跳过网络重复拉取 manifest 与 refs）'
         if: env.CACHE_REPO_ENABLED == 'true'
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: ${{ env.CACHE_REPO_PATH }}
           key: ${{ env.CACHE_REPO_KEY_PREFIX }}-${{ runner.os }}-${{ env.AOSP_TAG }}-${{ env.AOSP_REPO_DEPTH }}-${{ github.sha }}
@@ -290,7 +322,7 @@ jobs:
 
       - name: '上传编译日志（失败也上传，便于排错）'
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: logs-2-build_stage1
           path: |
@@ -311,7 +343,7 @@ jobs:
 
       - name: '上传 out 产物（分片 artifact）'
         if: success()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: out-stage1
           path: .ci_artifacts/out/part-*
@@ -327,7 +359,7 @@ jobs:
   build_stage2:
     name: '3/4 build_stage2 (metalava 串行专项)'
     needs: build_stage1
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.AOSP_RUNNER_OS || 'ubuntu-22.04' }}
     timeout-minutes: 300
     environment: aosp-build
 
@@ -338,7 +370,7 @@ jobs:
           df -hT; free -h; nproc
 
       - name: 'Checkout CI 仓库'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 1
 
@@ -350,7 +382,7 @@ jobs:
 
       - name: '恢复 .repo 缓存'
         if: env.CACHE_REPO_ENABLED == 'true'
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: ${{ env.CACHE_REPO_PATH }}
           key: ${{ env.CACHE_REPO_KEY_PREFIX }}-${{ runner.os }}-${{ env.AOSP_TAG }}-${{ env.AOSP_REPO_DEPTH }}-${{ github.sha }}
@@ -373,7 +405,7 @@ jobs:
           ./build_scripts/prepare_runner.sh --swap-only
 
       - name: '下载 stage1 的 out 产物'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: out-stage1
           path: .ci_artifacts/out
@@ -390,7 +422,7 @@ jobs:
 
       - name: '上传编译日志（失败也上传）'
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: logs-3-build_stage2
           path: |
@@ -412,7 +444,7 @@ jobs:
 
       - name: '上传 out 产物（分片 artifact）'
         if: success()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: out-stage2
           path: .ci_artifacts/out/part-*
@@ -428,7 +460,7 @@ jobs:
   build_stage3:
     name: '4/4 build_stage3 (镜像打包 system.img/vendor.img)'
     needs: build_stage2
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.AOSP_RUNNER_OS || 'ubuntu-22.04' }}
     timeout-minutes: 300
     environment: aosp-build
 
@@ -439,7 +471,7 @@ jobs:
           df -hT; free -h; nproc
 
       - name: 'Checkout CI 仓库'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 1
 
@@ -451,7 +483,7 @@ jobs:
 
       - name: '恢复 .repo 缓存'
         if: env.CACHE_REPO_ENABLED == 'true'
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: ${{ env.CACHE_REPO_PATH }}
           key: ${{ env.CACHE_REPO_KEY_PREFIX }}-${{ runner.os }}-${{ env.AOSP_TAG }}-${{ env.AOSP_REPO_DEPTH }}-${{ github.sha }}
@@ -474,7 +506,7 @@ jobs:
           ./build_scripts/prepare_runner.sh --swap-only
 
       - name: '下载 metalava 阶段 out 产物'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: out-stage2
           path: .ci_artifacts/out
@@ -497,7 +529,7 @@ jobs:
 
       - name: '上传编译日志（失败也上传）'
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: logs-4-build_stage3
           path: |
@@ -511,7 +543,7 @@ jobs:
 
       - name: '上传最终 ARM64 镜像 artifact（长期保留）'
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: aosp_arm64-eng-images
           path: |

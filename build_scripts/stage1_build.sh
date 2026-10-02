@@ -47,9 +47,12 @@ main() {
   [ -d "$AOSP_SRC_DIR/build/make" ] || die "${AOSP_SRC_DIR} 不是有效的 AOSP 根目录（缺 build/make）"
 
   # ---------------------------------------------------------------- 0) 资源准备
+  ensure_writable_dir "$AOSP_SRC_DIR"
   create_swap "$AOSP_SWAP_SIZE_GB" "$AOSP_SWAP_FILE"
   report_memory
   require_free_gb "$AOSP_FREE_SPACE_GB" "$AOSP_SRC_DIR"
+  # 容量预估：源码实测 + swap + out 估计，编译前就把磁盘不够的问题暴露出来
+  project_build_capacity "$AOSP_SRC_DIR"
 
   # ---------------------------------------------------------------- 1) lunch
   aosp_lunch "$AOSP_LUNCH_TARGET"

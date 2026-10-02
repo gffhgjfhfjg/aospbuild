@@ -74,6 +74,10 @@ ensure_repo_tool() {
 do_repo_init() {
   banner "repo init  (tag=${AOSP_TAG})"
   ensure_repo_tool
+
+  # 可写性预检：runner 上 /mnt、/opt 这类 root 拥有的目录会直接 Permission denied，
+  # 必须在 repo init 前就失败并说清楚，否则 2 分钟后才炸且看不出原因。
+  ensure_writable_dir "$AOSP_SRC_DIR"
   mkdir -p "$AOSP_SRC_DIR"
   cd "$AOSP_SRC_DIR"
 
@@ -271,6 +275,10 @@ log "  repo retry-fetches  = ${AOSP_REPO_RETRY_FETCHES}"
 log "  repo depth          = ${AOSP_REPO_DEPTH}"
 log "  PATCH_DIR           = ${PATCH_DIR}"
 log "  PATCH_APPLY_ENABLED = ${PATCH_APPLY_ENABLED}"
+
+# 开工前统一做一次可写性 + 资源自检（不管跑哪个子命令）
+ensure_writable_dir "$AOSP_SRC_DIR"
+resource_report
 
 [ "$do_init" -eq 1 ]      && do_repo_init
 [ "$do_sync" -eq 1 ]      && do_repo_sync

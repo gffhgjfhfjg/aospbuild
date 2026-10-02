@@ -23,7 +23,9 @@ fi
 : "${AOSP_TAG:=android-10.0.0_r47}"
 : "${AOSP_MANIFEST_URL:=https://android.googlesource.com/platform/manifest}"
 : "${AOSP_MIRROR_MANIFEST:=}"
-: "${AOSP_SRC_DIR:=/mnt/aosp}"
+# 注意：GitHub runner 上 /mnt 由 root 拥有，runner 用户 mkdir 会 Permission denied。
+#       实测整机只有一个 ext4 根卷，任何路径可用空间相同，故放 $HOME 下。
+: "${AOSP_SRC_DIR:=/home/runner/aosp}"
 : "${AOSP_LUNCH_TARGET:=aosp_arm64-eng}"
 : "${AOSP_OUT_PRODUCT_DIR:=arm64}"
 : "${AOSP_REPO_SYNC_JOBS:=4}"
@@ -37,9 +39,12 @@ fi
 : "${AOSP_METALAVA_TARGETS:=metalava metalava-full metalava-sdk update-api}"
 : "${AOSP_STAGE3_IMAGE_TARGETS:=systemimg vendorimg odmimg productimg ramdisk userdataimg vbmetaimg}"
 : "${AOSP_SWAP_SIZE_GB:=16}"           # 硬性约束：16G swap
-: "${AOSP_SWAP_FILE:=/mnt/aosp.swap}"
+: "${AOSP_SWAP_FILE:=/home/runner/aosp.swap}"
+: "${AOSP_SWAP_MODE:=auto}"             # auto | zram | file | both | none
 : "${AOSP_ENABLE_SWAP:=1}"
 : "${AOSP_FREE_SPACE_GB:=40}"
+: "${AOSP_OUT_ESTIMATE_GB:=45}"
+: "${AOSP_FREE_SPACE_GUARD:=1}"
 : "${AOSP_OUT_PACK_MODE:=slim}"        # slim | full
 : "${AOSP_OUT_PACK_LEVEL:=3}"
 : "${AOSP_OUT_PART_MB:=8000}"
@@ -157,13 +162,77 @@ require_free_gb() {
   log "分区 ${p} 剩余 ${avail}GB，需要 >= ${need}GB"
   if [ "$avail" -lt "$need" ]; then
     err "剩余空间不足：${avail}GB < ${need}GB。"
-    err "GitHub 托管 ubuntu-latest 整机仅 ~72GB SSD，装不下 AOSP 全量源码 + out。"
+    err "GitHub 托管 runner 只有 ~87GB 可用，装不下 AOSP 源码 + 16G swap + out。"
     err "可行处理："
     err "  1) 换用带大容量磁盘的 self-hosted runner（推荐，见 README「硬性容量约束」）；"
-    err "  2) 启用 --prune-source 裁剪无关源码，并把 AOSP_SRC_DIR 指向剩余空间最大的挂载点；"
+    err "  2) 启用 --prune-source 裁剪无关源码，并调小 AOSP_OUT_ESTIMATE_GB；"
     err "  3) 调低 AOSP_FREE_SPACE_GB 只做告警（不推荐，磁盘写满会导致 out 不可用）。"
     exit 1
   fi
+}
+
+# =============================================================================
+# 6b. 可写性预检 + 编译容量预估
+#     runner 上踩过的坑：/mnt 由 root 拥有，runner 用户 mkdir 直接 Permission denied，
+#     必须在 repo init 之前就失败并说清楚，否则只会在 2 分钟后才炸。
+# =============================================================================
+ensure_writable_dir() {
+  local d="$1"
+  if mkdir -p "$d" 2>/dev/null && [ -w "$d" ]; then
+    log "目录可写: ${d}"
+    return 0
+  fi
+  err "无法创建/写入目录: ${d}"
+  err "该路径可能属于 root（例如 /mnt、/opt、/usr/local/src）。"
+  err "GitHub runner 的普通用户是 'runner'（uid 1001），只有 \$HOME 与 \$GITHUB_WORKSPACE 可写。"
+  err "请把 AOSP_SRC_DIR 改成 \$HOME 下的路径，例如 /home/runner/aosp"
+  exit 1
+}
+
+# 编译前容量预估：
+#   可用空间  >=  源码占用 + swap + out 预估
+# 不满足就提前失败（并给出可执行的调优建议），避免编译到 90% 时磁盘写满、out 半残。
+project_build_capacity() {
+  banner "编译容量预估"
+  local p="${1:-$AOSP_SRC_DIR}"
+  local avail src_gb swap_gb out_gb need_gb
+  avail="$(df -BG --output=avail "$p" | tail -n1 | tr -dc '0-9')"
+  src_gb="$(du -BG --exclude=out --exclude=.repo "$AOSP_SRC_DIR" 2>/dev/null | cut -f1 | tr -dc '0-9' || echo 0)"
+  swap_gb="$AOSP_SWAP_SIZE_GB"
+  out_gb="$AOSP_OUT_ESTIMATE_GB"
+  need_gb=$(( src_gb + swap_gb + out_gb ))
+
+  log "  分区可用     : ${avail}GB"
+  log "  AOSP 源码    : ${src_gb}GB"
+  log "  swap 文件    : ${swap_gb}GB"
+  log "  out 预估     : ${out_gb}GB"
+  log "  合计需要     : ${need_gb}GB"
+
+  {
+    echo "avail_gb=${avail}"
+    echo "source_gb=${src_gb}"
+    echo "swap_gb=${swap_gb}"
+    echo "out_estimate_gb=${out_gb}"
+    echo "need_gb=${need_gb}"
+  } > "${CI_LOG_DIR}/capacity-projection.txt"
+
+  if [ "$avail" -ge "$need_gb" ]; then
+    log "容量充足（余量 $(( avail - need_gb ))GB）✓"
+    return 0
+  fi
+
+  local gap=$(( need_gb - avail ))
+  err "容量不足：缺 ${gap}GB"
+  err "按影响从大到小的处理顺序："
+  err "  1) 换大磁盘 runner（唯一根治方案，README 第四章）"
+  err "  2) 把 AOSP_OUT_ESTIMATE_GB 调小并开启更多 --prune-source 项（省 5~15GB 源码）"
+  err "  3) 把 AOSP_SWAP_SIZE_GB 从 16 调小（swap 占的是同一块盘）"
+  err "     注意：调小 swap 会提高 OOM 风险（runner 只有 15GB 物理内存）"
+  if [ "${AOSP_FREE_SPACE_GUARD:-1}" = "1" ]; then
+    err "守卫开启，直接终止。确认要冒险继续请设 AOSP_FREE_SPACE_GUARD=0（out 可能在编译中损坏）"
+    exit 1
+  fi
+  warn "守卫已关闭，继续执行（out 可能在编译途中因磁盘写满而损坏）"
 }
 
 # =============================================================================

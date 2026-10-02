@@ -60,11 +60,14 @@ APT_PKGS_CORE=(
 )
 
 # 2) Ubuntu 22.04 兼容补充（AOSP10 官方清单基于 18.04/20.04，22.04 需额外补）
+#    注意：libiostream-dev 在 22.04 已不存在（apt 源里查不到），
+#          install_group 逐个安装并在失败时告警，不会中断，但列在这里只是噪音，故移除。
 APT_PKGS_COMPAT=(
   python3
   python3-dev
-  python-is-python3          # 关键：提供 /usr/bin/python -> python3
-  libtinfo5                  # 22.04 默认 libtinfo6，lib32ncurses5 依赖 libtinfo5
+  python3-distutils        # 22.04 的 python3.10 里 distutils 仍可用但已弃用，显式装上更稳
+  python-is-python3        # 关键：提供 /usr/bin/python -> python3
+  libtinfo5                # lib32ncurses5 依赖 libtinfo5
   m4
   gperf
   automake
@@ -82,7 +85,6 @@ APT_PKGS_COMPAT=(
   mtools
   x11proto-core-dev
   imagemagick
-  openjdk-8-jdk              # 部分老 prebuilt 脚本硬要求 JAVA_HOME 指向 8，缺了不致命
 )
 
 # 3) 可选：GPU/图形/远程调试相关，AOSP 参考镜像不依赖，默认不装
@@ -141,6 +143,11 @@ install_apt_deps() {
   # ---- python2 -> python3 兼容（Ubuntu 22.04 必做）----
   ensure_python3_alias
 
+  # ---- JDK 11（AOSP 10 硬要求）----
+  #    Ubuntu 24.04 的默认 JDK 是 17，22.04 是 11；这里不依赖默认值，
+  #    显式把 JAVA_HOME 指向 JDK 11，并在 AOSP 源码就位后用 prebuilts/jdk 兜底。
+  setup_java11
+
   # ---- git 全局配置，避免 repo sync 阶段反复询问 ----
   git config --global user.email  "ci@aosp-build.local"
   git config --global user.name   "AOSP CI"
@@ -176,6 +183,49 @@ locale_gen_utf8() {
     $SUDO locale-gen C.UTF-8 2>/dev/null || warn "locale-gen C.UTF-8 失败（一般不影响构建）"
   fi
   export LANG="${LANG:-C.UTF-8}"
+}
+
+# =============================================================================
+# JDK 11 定位与 JAVA_HOME 设置
+# -----------------------------------------------------------------------------
+#  AOSP 10 要求 JDK 11。优先级：
+#    1) AOSP 自带 prebuilts/jdk/jdk11（最权威，envsetup.sh 自己也会用它）
+#    2) 系统的 /usr/lib/jvm/java-11-openjdk-*
+#    3) 找不到 -> 告警（不同 AOSP 版本 fallback 行为不同，不硬失败）
+# =============================================================================
+setup_java11() {
+  local root="${1:-$AOSP_SRC_DIR}"
+
+  # 1) AOSP 自带 JDK
+  if [ -x "$root/prebuilts/jdk/jdk11/bin/javac" ]; then
+    export JAVA_HOME="$root/prebuilts/jdk/jdk11"
+    export PATH="$JAVA_HOME/bin:$PATH"
+    log "JAVA_HOME = ${JAVA_HOME} (AOSP 自带 jdk11)"
+    return 0
+  fi
+
+  # 2) 系统 JDK 11
+  local cand
+  for cand in /usr/lib/jvm/java-11-openjdk-amd64 /usr/lib/jvm/java-11-openjdk-arm64; do
+    if [ -x "$cand/bin/javac" ]; then
+      export JAVA_HOME="$cand"
+      export PATH="$JAVA_HOME/bin:$PATH"
+      log "JAVA_HOME = ${JAVA_HOME} (系统 JDK 11)"
+      return 0
+    fi
+  done
+
+  # 3) 兜底：看看当前 java 是多少版本
+  if command -v java >/dev/null 2>&1; then
+    local ver
+    ver="$(java -version 2>&1 | head -n1)"
+    warn "未找到 JDK 11，当前 java: ${ver}"
+    warn "AOSP 10 官方要求 JDK 11。若编译期出现 javac/UnsupportedClassVersionError，"
+    warn "请在 workflow env 里显式设置 JAVA_HOME，或用 self-hosted runner 预装 JDK 11。"
+  else
+    warn "未找到任何 java，AOSP 10 编译将失败（需要 JDK 11）"
+  fi
+  return 0
 }
 
 # =============================================================================
