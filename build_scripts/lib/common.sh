@@ -408,20 +408,66 @@ aosp_out()      { echo "${AOSP_SRC_DIR}/out"; }
 aosp_product()  { echo "${AOSP_SRC_DIR}/out/target/product/${AOSP_OUT_PRODUCT_DIR}"; }
 
 # 进入 AOSP 根目录并 source envsetup + lunch。
-# 注意：envsetup.sh 内部会 `set +u` 并使用未定义变量，必须临时关掉 -u/pipefail。
+#
+# 【为什么这么绕 —— run 36978202595 实测踩的坑】
+# AOSP 10 的 build/envsetup.sh 里，m() 在第 744 行直接引用 $TOP。
+# 当 TOP 未预置、且 shell 处于 nounset（set -u）状态时会报：
+#     build/envsetup.sh: line 744: TOP: unbound variable
+#     Couldn't locate the top of the tree.  Try setting TOP.
+# 表现极具迷惑性：envsetup 和 lunch 都成功了、工具链自检也过了，
+# 但紧接着的 `m nothing` 直接失败 —— 看起来像 soong 问题，其实是 shell 选项问题。
+#
+# 三管齐下：
+#   1) 预置并 export TOP / ANDROID_BUILD_TOP，让 envsetup 跳过目录发现逻辑
+#   2) 关闭 nounset（AOSP 的 envsetup 与 m() 大量使用未加 :- 的变量引用）
+#   3) 不再把 nounset 恢复回去 —— 后续所有 m 调用都依赖它处于关闭状态
+#
+# 副作用：脚本余下部分不再有 nounset 保护（变量名打错不会报错）。
+# 所有对外参数都用 ${VAR:-default} 兜了默认值，可接受。
 aosp_lunch() {
   local target="${1:-$AOSP_LUNCH_TARGET}"
   cd "$AOSP_SRC_DIR"
+
+  export TOP="$AOSP_SRC_DIR"
+  export ANDROID_BUILD_TOP="$AOSP_SRC_DIR"
+
   log "source build/envsetup.sh + lunch ${target}"
-  set +u +o pipefail
+  set +u
+  set +o pipefail
   # shellcheck disable=SC1091
   source build/envsetup.sh
-  lunch "$target" || { set -u -o pipefail; die "lunch ${target} 失败"; }
-  set -u -o pipefail
-  log "LUNCH 目标: ${TARGET_PRODUCT}/${TARGET_BUILD_VARIANT}"
-  log "TARGET_ARCH : ${TARGET_ARCH:-<unset>}"
-  log "out 目录    : $(aosp_out)"
-  [ "${TARGET_ARCH:-}" = "arm64" ] || warn "TARGET_ARCH=${TARGET_ARCH:-<unset>}，期望 arm64"
+  lunch "$target" || die "lunch ${target} 失败"
+  # 双保险：即使 envsetup 内部覆盖过，这里再导出一次
+  export TOP="${TOP:-$AOSP_SRC_DIR}"
+  export ANDROID_BUILD_TOP="${ANDROID_BUILD_TOP:-$AOSP_SRC_DIR}"
+
+  log "TOP=$TOP"
+  log "TARGET_PRODUCT=${TARGET_PRODUCT:-<unset>}  TARGET_BUILD_VARIANT=${TARGET_BUILD_VARIANT:-<unset>}"
+  # 注意：不要检查 TARGET_ARCH —— 它是 make 变量(build/core/config.mk)，
+  # 不是 shell 环境变量，lunch 之后在 shell 里本来就查不到。
+  # 判断 lunch 是否生效要看 TARGET_PRODUCT / TARGET_BUILD_VARIANT。
+  if [ "${TARGET_PRODUCT:-}" != "aosp_arm64" ]; then
+    warn "TARGET_PRODUCT=${TARGET_PRODUCT:-<unset>}，期望 aosp_arm64（lunch 可能未生效）"
+  fi
+  if [ "${TARGET_BUILD_VARIANT:-}" != "eng" ]; then
+    warn "TARGET_BUILD_VARIANT=${TARGET_BUILD_VARIANT:-<unset>}，期望 eng"
+  fi
+
+  # m() 能否工作，取决于 nounset 是否关闭 —— 这里做一次真实自检
+  if ! command -v m >/dev/null 2>&1 && ! type m >/dev/null 2>&1; then
+    die "envsetup 之后 m 函数不存在，lunch 流程异常"
+  fi
+  log "out 目录: $(aosp_out)"
+  # 精确读取 nounset 状态。
+  #   不能用 `set -o | grep -q nounset`  —— 关闭时也会打印 "nounset  off"，仍会命中。
+  #   也不能用 glob *"nounset"*on*      —— bash 的 set -o 列表里 nounset 后面还有
+  #                                          onecmd 这类选项，含 "on"，会误判为 ON。
+  local nounset_state
+  nounset_state="$(set -o | awk '$1=="nounset"{print $2; exit}')"
+  if [ "$nounset_state" = "on" ]; then
+    die "nounset 处于 ON 状态，m() 会报 'TOP: unbound variable'。这是 run 36978202595 的失败原因。"
+  fi
+  log "nounset: ${nounset_state:-unknown} ✓（若为 on，m 会报 TOP: unbound variable）"
 }
 
 # 定位 ninja（AOSP 自带版本优先，@file 响应文件支持更可靠）
