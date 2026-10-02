@@ -1,0 +1,34 @@
+# =============================================================================
+#  .gitignore —— 只忽略本地调试/云端临时产物
+#  注意：workflow yaml、build_scripts/、patches/ 必须提交进 git
+# =============================================================================
+
+# --- 本地调试产物 ---
+ci_logs/
+dist_images/
+.ci_artifacts/
+out/
+aosp/
+*.log
+
+# --- 补丁 reject 残留 ---
+*.rej
+*.orig
+
+# --- 工具临时文件 ---
+*~
+*.swp
+.DS_Store
+Thumbs.db
+
+# --- 不要忽略（显式声明，防止误操作）---
+!.github/
+!.github/workflows/
+!.github/workflows/aosp_build.yml
+!build_scripts/
+!build_scripts/*.sh
+!build_scripts/lib/
+!build_scripts/lib/*.sh
+!patches/
+!patches/*.patch
+!patches/README.md
