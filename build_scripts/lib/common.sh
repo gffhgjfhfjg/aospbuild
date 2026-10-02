@@ -50,6 +50,16 @@ fi
 : "${AOSP_OUT_PART_MB:=8000}"
 : "${AOSP_ARTIFACT_RETENTION_DAYS:=5}"
 : "${AOSP_NINJA_TARGETS_MODE:=rspfile}" # rspfile(@file) | xargs
+# 完工判定的行数容差，0 = 严格（推荐）。
+# 容差 >0 会把"仅剩少量工作"误判成"已完成"，导致不完整的 out 被当成完整产物传下去。
+: "${AOSP_COMPLETE_TOLERANCE:=0}"
+# 编译 shard 的 SIGINT 优雅停止等待秒数（超时升级 SIGTERM -> SIGKILL）
+: "${AOSP_SHARD_SIGINT_GRACE_SEC:=120}"
+: "${AOSP_SHARD_INDEX:=1}"
+: "${AOSP_SHARD_TOTAL:=2}"
+: "${AOSP_SHARD_BUDGET_MIN:=250}"
+: "${AOSP_SHARD_DOWNLOAD:=0}"
+: "${AOSP_SHARD_REQUIRE_COMPLETE:=0}"
 : "${PATCH_DIR:=$(pwd)/patches}"
 : "${PATCH_APPLY_ENABLED:=1}"
 : "${CI_LOG_DIR:=$(pwd)/ci_logs}"
@@ -195,10 +205,10 @@ ensure_writable_dir() {
 project_build_capacity() {
   banner "编译容量预估"
   local p="${1:-$AOSP_SRC_DIR}"
-  local avail src_gb swap_gb out_gb need_gb
+  local out; out="$(aosp_out)"
+  local avail src_gb out_now_gb out_gb swap_gb need_gb
   avail="$(df -BG --output=avail "$p" | tail -n1 | tr -dc '0-9')"
-  # 源码体积要算完整的（含 .repo/.git），因为它们同样占磁盘。
-  # AOSP 10 --depth=1 实测：工作区+ .repo 合计约 62GB。
+  # 源码体积要算完整的（含 .repo/.git），它们同样占磁盘。
   src_gb="$(du -BG --exclude=out "$AOSP_SRC_DIR" 2>/dev/null | cut -f1 | tr -dc '0-9' || echo 0)"
   # zram 模式不占磁盘，file/both 模式才要计入
   if [ "${AOSP_SWAP_MODE:-auto}" = "zram" ]; then
@@ -208,14 +218,34 @@ project_build_capacity() {
   else
     swap_gb="$AOSP_SWAP_SIZE_GB"
   fi
-  out_gb="$AOSP_OUT_ESTIMATE_GB"
+  # out 已有多少（续跑 shard 时不能再把整份 out 都算成"还需要"）
+  out_now_gb=0
+  if [ -d "$out" ]; then
+    out_now_gb="$(du -BG "$out" 2>/dev/null | cut -f1 | tr -dc '0-9' || echo 0)"
+  fi
+  # 需要的"额外"空间 = out 满负荷估计 - 已有的
+  local out_need_extra=$(( AOSP_OUT_ESTIMATE_GB - out_now_gb ))
+  [ "$out_need_extra" -lt 0 ] && out_need_extra=0
+  out_gb="$out_need_extra"
   need_gb=$(( src_gb + swap_gb + out_gb ))
 
   log "  分区可用     : ${avail}GB"
   log "  AOSP 源码    : ${src_gb}GB (含 .repo/.git，不含 out)"
   log "  swap 文件    : ${swap_gb}GB (mode=${AOSP_SWAP_MODE:-auto}, zram 不占盘)"
-  log "  out 预估     : ${out_gb}GB"
+  log "  out 现状     : ${out_now_gb}GB / 满负荷估计 ${AOSP_OUT_ESTIMATE_GB}GB"
+  log "  out 还需     : ${out_gb}GB"
   log "  合计需要     : ${need_gb}GB"
+
+  {
+    echo "avail_gb=${avail}"
+    echo "source_gb=${src_gb}"
+    echo "swap_gb=${swap_gb}"
+    echo "out_now_gb=${out_now_gb}"
+    echo "out_estimate_gb=${AOSP_OUT_ESTIMATE_GB}"
+    echo "out_need_extra_gb=${out_gb}"
+    echo "need_gb=${need_gb}"
+    echo "shard=${AOSP_SHARD_INDEX:-1}/${AOSP_SHARD_TOTAL:-1}"
+  } > "${CI_LOG_DIR}/capacity-projection.txt"
 
   {
     echo "avail_gb=${avail}"

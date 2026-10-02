@@ -31,6 +31,14 @@ on:
         description: 'out 目录打包模式：slim=裁剪可再生中间物(默认) / full=原样全量'
         required: false
         default: 'slim'
+      compile_shards:
+        description: '编译 job(shard) 数量。-j1 全量编译需 5~8h，单 job 上限 5h，故拆分。每个 shard 约 250 分钟有效编译时间；不够就调大此值（并复制一个 build_stage1c job）'
+        required: false
+        default: '2'
+      shard_budget_min:
+        description: '每个编译 shard 的 ninja 时间预算（分钟）。需给 swap/repo sync/打包上传留出时间，故 < 300'
+        required: false
+        default: '250'
   push:
     branches:
       - 'main'
@@ -165,7 +173,7 @@ jobs:
   #         python shebang 修复、删除 crosshatch/bonito 设备树、缓存 .repo
   # ===========================================================================
   sync_source:
-    name: '1/4 sync_source (repo sync + 工具链 + 补丁)'
+    name: '1/5 sync_source (repo sync + 工具链 + 补丁)'
     runs-on: ${{ vars.AOSP_RUNNER_OS || 'ubuntu-22.04' }}
     timeout-minutes: 300
     environment: aosp-build          # 便于在仓库 Settings -> Environments 加审批与计费归类
@@ -262,7 +270,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: logs-1-sync_source
+          name: logs-1-sync
           path: |
             ci_logs/
           retention-days: 7
@@ -270,16 +278,31 @@ jobs:
           compression-level: 6
 
   # ===========================================================================
-  # Job 2 / 4 —— build_stage1
-  #   职责：16G swap、lunch aosp_arm64-eng、-j1 编译「除 metalava 外全部 ninja 目标」、
-  #         裁剪并分片打包 out -> artifact
+  # Job 2 / 5 —— build_stage1a （编译 shard 1/N）
+  #   职责：16G swap、lunch aosp_arm64-eng、-j1 编译「除 metalava 外全部 ninja 目标」
+  #         跑到时间预算就优雅停止 -> 打包 out -> artifact
+  #
+  #   【为什么拆成多个编译 job】
+  #   -j1 编译 aosp_arm64-eng 全量目标实测需要 5~8 小时，而单 job 硬上限 300 分钟。
+  #   拆成 N 个 shard：AOSP_COMPILE_SHARDS 控制个数，N 个 job 串行。
+  #
+  #   【分片原理：不按目标名切分，按时间预算 + 增量续跑】
+  #   每个 shard 跑**同一份完整目标清单**。ninja 天然跳过已完成的边，
+  #   所以 shard2 会自动从 shard1 停下的地方接着编，工作量自然向后流动。
+  #   这样零拓扑分析风险（按名字切分会破坏依赖顺序或让下游重做上游的活）。
   # ===========================================================================
-  build_stage1:
-    name: '2/4 build_stage1 (-j1 全量编译，排除 metalava)'
+  build_stage1a:
+    name: '2/5 build_stage1a (编译 shard 1/${{ inputs.compile_shards || 2 }})'
     needs: sync_source
     runs-on: ${{ vars.AOSP_RUNNER_OS || 'ubuntu-22.04' }}
     timeout-minutes: 300
     environment: aosp-build
+    env:
+      AOSP_SHARD_INDEX: '1'
+      AOSP_SHARD_TOTAL: ${{ inputs.compile_shards || '2' }}
+      AOSP_SHARD_BUDGET_MIN: ${{ inputs.shard_budget_min || '250' }}
+      AOSP_SHARD_DOWNLOAD: '0'
+      AOSP_SHARD_REQUIRE_COMPLETE: '0'
 
     steps:
       - name: '打印 runner 规格与磁盘布局'
@@ -326,7 +349,7 @@ jobs:
           set -euo pipefail
           ./build_scripts/prepare_runner.sh --swap-only
 
-      - name: 'stage1 串行编译（-j1，排除 metalava 全部其余 ninja 目标）'
+      - name: '编译 shard 1（-j1，排除 metalava，时间预算内增量编译）'
         run: |
           set -euo pipefail
           ./build_scripts/stage1_build.sh
@@ -335,7 +358,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: logs-2-build_stage1
+          name: logs-shard1
           path: |
             ci_logs/
             out/soong/*.log
@@ -345,8 +368,7 @@ jobs:
           if-no-files-found: warn
           compression-level: 6
 
-      - name: '打包 out 目录（分片 zstd，供 Job3/Job4 下载）'
-        id: pack
+      - name: '打包 out 目录（分片 zstd，供后续 shard 增量续跑）'
         if: success()
         run: |
           set -euo pipefail
@@ -356,7 +378,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v7
         with:
-          name: out-stage1
+          name: out-shard1
           path: .ci_artifacts/out/part-*
           retention-days: ${{ env.AOSP_ARTIFACT_RETENTION_DAYS }}
           if-no-files-found: error
@@ -364,12 +386,119 @@ jobs:
           overwrite: true
 
   # ===========================================================================
+  # Job 3 / 5 —— build_stage1b （编译 shard 2/N，最后一个必须编完）
+  #   与 1a 跑同一份目标清单，ninja 跳过已完成部分继续往后编。
+  #   若 2 个 shard 不够，把 compile_shards 调到 3，并复制本 job 一份改成 3c。
+  # ===========================================================================
+  build_stage1b:
+    name: '3/5 build_stage1b (编译 shard 2/${{ inputs.compile_shards || 2 }})'
+    needs: build_stage1a
+    runs-on: ${{ vars.AOSP_RUNNER_OS || 'ubuntu-22.04' }}
+    timeout-minutes: 300
+    environment: aosp-build
+    env:
+      AOSP_SHARD_INDEX: '2'
+      AOSP_SHARD_TOTAL: ${{ inputs.compile_shards || '2' }}
+      AOSP_SHARD_BUDGET_MIN: ${{ inputs.shard_budget_min || '250' }}
+      AOSP_SHARD_DOWNLOAD: '1'
+      # 最后一个 shard 必须把目标编完，否则直接失败并提示调大 compile_shards
+      AOSP_SHARD_REQUIRE_COMPLETE: '1'
+
+    steps:
+      - name: '打印 runner 规格与磁盘布局'
+        run: |
+          set -euo pipefail
+          df -hT; free -h; nproc
+
+      - name: 'Checkout CI 仓库'
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: '安装宿主依赖 + ARM64 交叉编译工具链'
+        run: |
+          set -euo pipefail
+          chmod +x build_scripts/*.sh build_scripts/lib/*.sh
+          ./build_scripts/prepare_runner.sh --deps-only
+
+      - name: '恢复 .repo 缓存'
+        if: env.CACHE_REPO_ENABLED == 'true'
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.CACHE_REPO_PATH }}
+          key: ${{ env.CACHE_REPO_KEY_PREFIX }}-${{ runner.os }}-${{ env.AOSP_TAG }}-${{ env.AOSP_REPO_DEPTH }}-${{ github.sha }}
+          restore-keys: |
+            ${{ env.CACHE_REPO_KEY_PREFIX }}-${{ runner.os }}-${{ env.AOSP_TAG }}-${{ env.AOSP_REPO_DEPTH }}-
+            ${{ env.CACHE_REPO_KEY_PREFIX }}-${{ runner.os }}-${{ env.AOSP_TAG }}-
+
+      - name: 'repo sync'
+        run: |
+          set -euo pipefail
+          ./build_scripts/sync_source.sh --init
+          ./build_scripts/sync_source.sh --sync
+          ./build_scripts/sync_source.sh --fix-python
+          ./build_scripts/sync_source.sh --prune-device-trees
+          ./build_scripts/sync_source.sh --apply-patches
+
+      - name: '准备 16G swap + 空间守卫'
+        run: |
+          set -euo pipefail
+          ./build_scripts/prepare_runner.sh --swap-only
+
+      - name: '下载 shard 1 的 out 产物（增量续跑的前提）'
+        uses: actions/download-artifact@v8
+        with:
+          name: out-shard1
+          path: .ci_artifacts/out
+
+      - name: '解包 out 目录（还原权限/符号链接/硬链接）'
+        run: |
+          set -euo pipefail
+          ./build_scripts/lib/artifacts.sh unpack
+
+      - name: '编译 shard 2（-j1，增量续跑，必须编完）'
+        run: |
+          set -euo pipefail
+          ./build_scripts/stage1_build.sh
+
+      - name: '上传编译日志（失败也上传，便于排错）'
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: logs-shard2
+          path: |
+            ci_logs/
+            out/soong/*.log
+            out/err.log
+            out/*.log
+          retention-days: 7
+          if-no-files-found: warn
+          compression-level: 6
+
+      - name: '打包 out 目录（供 metalava 阶段使用）'
+        if: success()
+        run: |
+          set -euo pipefail
+          ./build_scripts/lib/artifacts.sh pack
+
+      - name: '上传 out 产物（分片 artifact）'
+        if: success()
+        uses: actions/upload-artifact@v7
+        with:
+          name: out-shard2
+          path: .ci_artifacts/out/part-*
+          retention-days: ${{ env.AOSP_ARTIFACT_RETENTION_DAYS }}
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+
+  # ===========================================================================
   # Job 3 / 4 —— build_stage2 (metalava)
   #   职责：下载 stage1 的 out，串行单独执行所有 metalava 任务（含 update-api）
   # ===========================================================================
   build_stage2:
-    name: '3/4 build_stage2 (metalava 串行专项)'
-    needs: build_stage1
+    name: '4/5 build_stage2 (metalava 串行专项)'
+    needs: build_stage1b
     runs-on: ${{ vars.AOSP_RUNNER_OS || 'ubuntu-22.04' }}
     timeout-minutes: 300
     environment: aosp-build
@@ -415,10 +544,10 @@ jobs:
           set -euo pipefail
           ./build_scripts/prepare_runner.sh --swap-only
 
-      - name: '下载 stage1 的 out 产物'
+      - name: '下载最后一个编译 shard 的 out 产物'
         uses: actions/download-artifact@v8
         with:
-          name: out-stage1
+          name: out-shard2
           path: .ci_artifacts/out
 
       - name: '解包 out 目录（还原权限/符号链接/硬链接）'
@@ -435,7 +564,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: logs-3-build_stage2
+          name: logs-4-metalava
           path: |
             ci_logs/
             out/soong/*.log
@@ -469,7 +598,7 @@ jobs:
   #   职责：下载 metalava 阶段 out，执行镜像打包，导出 ARM64 system.img/vendor.img 等
   # ===========================================================================
   build_stage3:
-    name: '4/4 build_stage3 (镜像打包 system.img/vendor.img)'
+    name: '5/5 build_stage3 (镜像打包 system.img/vendor.img)'
     needs: build_stage2
     runs-on: ${{ vars.AOSP_RUNNER_OS || 'ubuntu-22.04' }}
     timeout-minutes: 300
@@ -542,7 +671,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: logs-4-build_stage3
+          name: logs-5-package
           path: |
             ci_logs/
             out/soong/*.log

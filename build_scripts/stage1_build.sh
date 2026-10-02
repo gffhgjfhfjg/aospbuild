@@ -30,18 +30,34 @@ source "${_here}/lib/ninja_targets.sh"
 source "${_here}/lib/artifacts.sh"
 # shellcheck source=lib/apt_deps.sh
 source "${_here}/lib/apt_deps.sh"
+# shellcheck source=lib/compile_shard.sh
+source "${_here}/lib/compile_shard.sh"
 
-start_logging "stage1_build"
+# ---- 分片编译参数 ----
+: "${AOSP_SHARD_INDEX:=1}"          # 本 job 是第几个编译 shard（从 1 开始）
+: "${AOSP_SHARD_TOTAL:=2}"          # 编译 shard 总数
+: "${AOSP_SHARD_BUDGET_MIN:=250}"   # 本 job 的 ninja 时间预算（分钟）
+: "${AOSP_SHARD_DOWNLOAD:=0}"       # 1 = 本 job 需要先解包上一个 shard 的 out
+: "${AOSP_SHARD_REQUIRE_COMPLETE:=0}" # 1 = 本 job 是最后一个，必须把目标编完
+
+trap 'compile_shard_cleanup' EXIT
+
+# 带上 shard 编号，避免同名日志互相覆盖
+start_logging "stage1_build-shard${AOSP_SHARD_INDEX}of${AOSP_SHARD_TOTAL}"
 
 main() {
-  banner "Stage1 开始：aosp_arm64-eng -j1 串行编译（排除 metalava）"
+  banner "编译 shard ${AOSP_SHARD_INDEX}/${AOSP_SHARD_TOTAL} 开始：aosp_arm64-eng -j1 串行编译（排除 metalava）"
 
   log "参数:"
-  log "  AOSP_SRC_DIR      = ${AOSP_SRC_DIR}"
-  log "  AOSP_LUNCH_TARGET = ${AOSP_LUNCH_TARGET}"
-  log "  AOSP_BUILD_JOBS   = ${AOSP_BUILD_JOBS}"
-  log "  AOSP_SKIP_METALAVA= ${AOSP_SKIP_METALAVA}"
-  log "  AOSP_OUT_PACK_MODE= ${AOSP_OUT_PACK_MODE}"
+  log "  AOSP_SRC_DIR        = ${AOSP_SRC_DIR}"
+  log "  AOSP_LUNCH_TARGET   = ${AOSP_LUNCH_TARGET}"
+  log "  AOSP_BUILD_JOBS     = ${AOSP_BUILD_JOBS}"
+  log "  AOSP_SKIP_METALAVA  = ${AOSP_SKIP_METALAVA}"
+  log "  shard               = ${AOSP_SHARD_INDEX}/${AOSP_SHARD_TOTAL}"
+  log "  时间预算            = ${AOSP_SHARD_BUDGET_MIN} 分钟"
+  log "  需解包上游 out      = ${AOSP_SHARD_DOWNLOAD}"
+  log "  必须编完            = ${AOSP_SHARD_REQUIRE_COMPLETE}"
+  log "  AOSP_OUT_PACK_MODE  = ${AOSP_OUT_PACK_MODE}"
 
   [ -d "$AOSP_SRC_DIR" ] || die "AOSP 源码目录不存在: ${AOSP_SRC_DIR}（请先执行 sync_source.sh）"
   [ -d "$AOSP_SRC_DIR/build/make" ] || die "${AOSP_SRC_DIR} 不是有效的 AOSP 根目录（缺 build/make）"
@@ -51,8 +67,20 @@ main() {
   create_swap "$AOSP_SWAP_SIZE_GB" "$AOSP_SWAP_FILE"
   report_memory
   require_free_gb "$AOSP_FREE_SPACE_GB" "$AOSP_SRC_DIR"
-  # 容量预估：源码实测 + swap + out 估计，编译前就把磁盘不够的问题暴露出来
+  # 容量预估：源码实测 + swap + out 还需空间（续跑 shard 时 out 已存在，不会重复计）
   project_build_capacity "$AOSP_SRC_DIR"
+
+  # ---------------------------------------------------------------- 0b) 解包上游 out
+  local out; out="$(aosp_out)"
+  if [ "$AOSP_SHARD_DOWNLOAD" = "1" ]; then
+    if [ -f "$out/soong/build.ninja" ]; then
+      log "检测到已解包的 out 目录，跳过解包"
+    else
+      banner "解包上一个编译 shard 的 out 目录（增量续跑的前提）"
+      artifacts_unpack
+      log "out 体积: $(du -sh "$out" | cut -f1)"
+    fi
+  fi
 
   # ---------------------------------------------------------------- 1) lunch
   aosp_lunch "$AOSP_LUNCH_TARGET"
@@ -94,36 +122,51 @@ main() {
   plan_print_phony_summary
 
   # ---------------------------------------------------------------- 5) 串行编译
-  #  两种执行路径：
-  #    A) rspfile 模式（默认）：把保留目标写入 .rsp，用 ninja @file 精确构建
-  #    B) xargs 模式：ninja 不支持 @file 时的回退，分批喂目标
-  local out ninja
-  out="$(aosp_out)"
+  #  分片策略：所有 shard 跑**同一份完整目标清单**，靠时间预算划分工作量。
+  #  ninja 天然跳过已完成的边，所以 shard2+ 会自动从 shard1 停下的地方接着编。
+  #  绝不能按目标名切分 —— 那会破坏依赖顺序或让下游重做上游的活。
+  local ninja
   ninja="$(find_ninja)"
 
+  local rsp="$out/.stage1_targets.rsp"
   if [ "$AOSP_SKIP_METALAVA" = "1" ]; then
-    banner "串行编译保留目标（-j${AOSP_BUILD_JOBS}，已排除 metalava）"
-    case "$AOSP_NINJA_TARGETS_MODE" in
-      xargs)
-        warn "使用 xargs 回退模式：ninja 可能不支持 @file 响应文件"
-        # 分批：每批 2000 个目标，ninja 自身会做依赖排序，重复目标无副作用
-        grep -v '^all$' "$out/.ninja_targets_keep.txt" \
-          | grep -vE '^clean' \
-          | xargs -r -n 2000 "$ninja" -C "$out" -j"$AOSP_BUILD_JOBS" -k "$AOSP_BUILD_KEEP_GOING"
+    # 排除 all / clean / rebuild 这类聚合或清理目标：
+    #   all 是 metalava 的总入口，不排除会把 metalava 拉回本阶段
+    grep -v -x -e 'all' -e 'clean' -e 'rebuild' "$out/.ninja_targets_keep.txt" > "$rsp" || true
+    local n_rsp
+    n_rsp="$(wc -l < "$rsp")"
+    log "目标清单 ${rsp}（${n_rsp} 个目标，已排除 metalava 与其 API 产物）"
+    if [ "$n_rsp" -eq 0 ]; then
+      die "目标清单为空，请检查 ninja 目标规划（out/.ninja_targets_keep.txt）"
+    fi
+  else
+    warn "AOSP_SKIP_METALAVA != 1，走 m all（含 metalava）路径，不做分片"
+  fi
+
+  local build_rc=0
+  if [ "$AOSP_SKIP_METALAVA" = "1" ]; then
+    set +e
+    build_with_budget "$rsp" "$out" "$AOSP_SHARD_BUDGET_MIN"
+    build_rc=$?
+    set -e
+
+    case "$build_rc" in
+      0)
+        log "本 shard 预算内跑完了全部目标 ✓"
         ;;
-      rspfile|*)
-        local rsp="$out/.stage1_targets.rsp"
-        # 排除 all / clean 这类聚合/清理目标：all 会把 metalava 重新拉进来
-        grep -v -x -e 'all' -e 'clean' -e 'rebuild' "$out/.ninja_targets_keep.txt" > "$rsp" || true
-        local n_rsp
-        n_rsp="$(wc -l < "$rsp")"
-        log "响应文件 ${rsp}（${n_rsp} 个目标）"
-        if [ "$n_rsp" -eq 0 ]; then
-          die "保留目标清单为空，请检查 ninja 目标规划（out/.ninja_targets_keep.txt）"
-        fi
-        # -d explain 可解释为何某个目标没被构建；-w dupbuild=err 便于发现依赖图异常
-        "$ninja" -C "$out" -j"$AOSP_BUILD_JOBS" -k "$AOSP_BUILD_KEEP_GOING" \
-                 -w dupbuild=err -d explain "@${rsp}"
+      "$BUDGET_EXIT_EXHAUSTED")
+        log "本 shard 用完预算并优雅停止，剩余工作交给 shard $(( AOSP_SHARD_INDEX + 1 ))"
+        warn "下一次续跑时 ninja 会自动跳过已完成部分"
+        ;;
+      *)
+        err "ninja 失败（build_with_budget 返回 ${build_rc}）"
+        err "常见原因：磁盘写满 / 内存不足被 kill(exit 137) / 真实编译错误"
+        err "排查："
+        err "  1) 看本 job 日志里 ninja 的最后 50 行"
+        err "  2) ci_logs/capacity-projection.txt 确认磁盘余量"
+        err "  3) exit 137 = OOM，确认 zram/swap 是否生效（swapon --show）"
+        err "  4) 磁盘满会出现 'No space left on device'"
+        exit 1
         ;;
     esac
   else
@@ -131,12 +174,37 @@ main() {
     m -j"$AOSP_BUILD_JOBS" -k "$AOSP_BUILD_KEEP_GOING" all
   fi
 
+  # ---------------------------------------------------------------- 5b) 完工判定
+  banner "编译进度判定"
+  local done_flag=1   # 1 = 已全部编完
+  set +e
+  is_build_complete "$rsp" "$out"
+  if [ $? -eq 0 ]; then
+    done_flag=1
+    log "判定结果: 目标已全部构建完成 ✓"
+  else
+    done_flag=0
+    warn "判定结果: 仍有目标未构建（还有活留给后续 shard）"
+  fi
+  set -e
+
+  if [ "$AOSP_SHARD_REQUIRE_COMPLETE" = "1" ] && [ "$done_flag" -eq 0 ]; then
+    err "=========================================================="
+    err " 这是最后一个编译 shard，但目标仍未编完。"
+    err " 处理办法：把 AOSP_COMPILE_SHARDS 调大（当前 ${AOSP_SHARD_TOTAL}），"
+    err " 每个 shard 约 ${AOSP_SHARD_BUDGET_MIN} 分钟有效编译时间。"
+    err " 也可能是磁盘不够了 —— 看 ci_logs/capacity-projection.txt"
+    err "=========================================================="
+    exit 1
+  fi
+
   # ---------------------------------------------------------------- 6) 结果核验
-  banner "Stage1 编译结果核验"
+  banner "编译结果核验 (shard ${AOSP_SHARD_INDEX}/${AOSP_SHARD_TOTAL})"
 
   # 6a) 宿主工具冒烟测试 —— 在这里做最划算：
   #     此时 out/host/linux-x86/bin 里已经有 metalava / mksquashfs / mke2fs / avbtool 等，
-  #     如果它们缺共享库，现在发现只需几分钟；等 Job4 打包时才发现要浪费 8 小时。
+  #     如果它们缺共享库，现在发现只需几分钟；等打包时才发现要浪费好几小时。
+  #     注意：只在前置工具已构建时才有意义（第一个 shard 可能还没编到）。
   smoke_test_prebuilt_tools "$AOSP_SRC_DIR" "$(aosp_out)/host/linux-x86/bin"
 
   local prod; prod="$(aosp_product)"
@@ -166,7 +234,10 @@ main() {
 
   # ---------------------------------------------------------------- 7) 记录构建元信息
   {
-    echo "stage=stage1"
+    echo "stage=compile_shard"
+    echo "shard=${AOSP_SHARD_INDEX}/${AOSP_SHARD_TOTAL}"
+    echo "budget_min=${AOSP_SHARD_BUDGET_MIN}"
+    echo "build_complete=${done_flag}"
     echo "lunch_target=${AOSP_LUNCH_TARGET}"
     echo "aosp_tag=${AOSP_TAG}"
     echo "build_number=${BUILD_NUMBER}"
@@ -175,15 +246,19 @@ main() {
     echo "finished_at_utc=$(date -u +%FT%TZ)"
     echo "--- excluded (metalava) targets ---"
     cat "$(aosp_out)/.ninja_targets_exclude.txt" 2>/dev/null || true
-  } > "${CI_LOG_DIR}/stage1-meta.txt"
+  } > "${CI_LOG_DIR}/shard${AOSP_SHARD_INDEX}-meta.txt"
 
   # ---------------------------------------------------------------- 8) 打包 out
   artifacts_pack
 
-  banner "Stage1 完成"
-  log "构建元信息: ${CI_LOG_DIR}/stage1-meta.txt"
+  banner "编译 shard ${AOSP_SHARD_INDEX}/${AOSP_SHARD_TOTAL} 完成"
+  log "构建元信息: ${CI_LOG_DIR}/shard${AOSP_SHARD_INDEX}-meta.txt"
   log "out 分片目录: ${CI_ARTIFACT_DIR}/out"
-  log "下一步：workflow 会把 .ci_artifacts/out/part-* 上传为 out-stage1 artifact"
+  if [ "$done_flag" -eq 1 ]; then
+    log "状态: 目标已全部编完 ✓"
+  else
+    log "状态: 仍有目标未编完，下一个 shard 会增量续跑"
+  fi
 }
 
 main "$@"
