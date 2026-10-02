@@ -134,11 +134,19 @@ env:
   # auto = 优先 zram(内存压缩盘，不占磁盘)，磁盘宽裕时再加 swap 文件。
   #        47GB 要留给 out，16G swap 文件会直接吃掉三分之一。
   AOSP_SWAP_MODE: 'auto'
+  # auto 模式下 zram 在云 runner 上不可用（内核带 zram 但 num_devices=0，
+  # 只 modprobe 建不出设备）。此时默认不建 swap 文件 —— 把 5~6GB 让给 out，
+  # 因为 -j1 串行编译时同时只跑一个 clang/javac，15GiB 内存 + 3GiB 预置 swap 够用。
+  AOSP_SWAP_FALLBACK_FILE: '0'
   AOSP_ENABLE_SWAP: '1'
   AOSP_FREE_SPACE_GB: '40'              # 开工前剩余空间不足该值则直接失败
   # 编译前容量预估：源码实测 + swap + out 预估，超过可用空间则提前失败并给出建议
-  AOSP_OUT_ESTIMATE_GB: '42'            # aosp_arm64-eng 全量 out 的保守估计
-  AOSP_FREE_SPACE_GUARD: '1'            # 1=启用预估守卫, 0=只打印警告
+  AOSP_OUT_ESTIMATE_GB: '42'            # aosp_arm64-eng 全量 out 的保守估计（估计值, 非实测）
+  AOSP_SOURCE_ESTIMATE_GB: '64'         # repo sync --depth=1 实测 63~64GB
+  # 容量守卫默认只告警放行：它拿"估计值"否决构建本身就不可靠。
+  # 真正防"磁盘写满 out"的是编译期的磁盘监控 + 优雅停止。
+  AOSP_FREE_SPACE_GUARD: 'warn'         # warn=告警放行(默认) | 1=硬失败 | 0=静默
+  AOSP_DISK_STOP_GB: '5'                # 编译中磁盘低于此值就优雅停止，保留已完成部分
 
   # --- out 目录跨 job 传递 ---
   # slim = 裁掉可再生的中间物（obj/PACKAGES、obj/SOURCES、install staging 目录），

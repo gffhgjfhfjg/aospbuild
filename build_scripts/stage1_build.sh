@@ -67,8 +67,9 @@ main() {
   create_swap "$AOSP_SWAP_SIZE_GB" "$AOSP_SWAP_FILE"
   report_memory
   require_free_gb "$AOSP_FREE_SPACE_GB" "$AOSP_SRC_DIR"
-  # 容量预估：源码实测 + swap + out 还需空间（续跑 shard 时 out 已存在，不会重复计）
-  project_build_capacity "$AOSP_SRC_DIR"
+  # 容量守卫。注意参数顺序是 (phase, path)：
+  #   post_sync 表示源码已经 repo sync 落盘，因此**不能**再把源码算进需求侧。
+  project_build_capacity post_sync "$AOSP_SRC_DIR"
 
   # ---------------------------------------------------------------- 0b) 解包上游 out
   local out; out="$(aosp_out)"

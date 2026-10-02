@@ -40,11 +40,14 @@ fi
 : "${AOSP_STAGE3_IMAGE_TARGETS:=systemimg vendorimg odmimg productimg ramdisk userdataimg vbmetaimg}"
 : "${AOSP_SWAP_SIZE_GB:=16}"           # 硬性约束：16G swap
 : "${AOSP_SWAP_FILE:=/home/runner/aosp.swap}"
-: "${AOSP_SWAP_MODE:=auto}"             # auto | zram | file | both | none
+: "${AOSP_SWAP_MODE:=auto}"
+: "${AOSP_SWAP_FALLBACK_FILE:=0}"   # zram 不可用时是否退回建 swap 文件(会占 out 余量)             # auto | zram | file | both | none
 : "${AOSP_ENABLE_SWAP:=1}"
 : "${AOSP_FREE_SPACE_GB:=40}"
-: "${AOSP_OUT_ESTIMATE_GB:=45}"
-: "${AOSP_FREE_SPACE_GUARD:=1}"
+: "${AOSP_OUT_ESTIMATE_GB:=42}"
+: "${AOSP_SOURCE_ESTIMATE_GB:=64}"   # repo sync --depth=1 实测 63~64GB
+: "${AOSP_DISK_STOP_GB:=5}"           # 编译期磁盘阈值, 低于则优雅停止(不写坏 out)
+: "${AOSP_FREE_SPACE_GUARD:=warn}"   # warn=告警放行(默认) | 1=硬失败 | 0=静默
 : "${AOSP_OUT_PACK_MODE:=slim}"        # slim | full
 : "${AOSP_OUT_PACK_LEVEL:=3}"
 : "${AOSP_OUT_PART_MB:=8000}"
@@ -278,47 +281,81 @@ count_lines() {
 #  把 16GB 记进需求等于假设了一个大概率不会发生的最坏情况，会白白拒掉本来能跑的构建。
 #  swap 的真实决策由后面的 create_swap 依据当时的 df 做自适应，守卫不重复预扣。
 # =============================================================================
-AOSP_SOURCE_ESTIMATE_GB="${AOSP_SOURCE_ESTIMATE_GB:-63}"
+# 容量守卫
+# -----------------------------------------------------------------------------
+#  用法: project_build_capacity <pre_sync|post_sync> [path]
+#
+#  【三个踩过的坑 —— 这段注释就是防止再犯】
+#
+#  1) 不要把已经落盘的东西再加进需求侧。
+#     `df --output=avail` 给的是"当前剩余"，任何已经写到这块盘上的文件
+#     都已经被扣掉了。重复计入会直接否决掉本来能跑通的构建：
+#       * 源码: run 36970996892 之前，avail=112 却算出 need=63+42+16=121
+#       * swap: run 36972642241，avail=44（已含 swap 文件占的 6GB）
+#               又把 swap_on_disk=6 加进需求 -> need=48 > 44 -> 误报"缺 4GB"
+#     所以：
+#       pre_sync  （sync 之前）源码未落盘 -> 全额计入；swap 尚未创建 -> 0
+#       post_sync （sync 之后）源码已落盘 -> 不计；  swap 已落盘     -> 不计
+#
+#  2) 参数顺序必须是 (phase, path)。曾经把 path 传到第一个参数，
+#     结果 phase 变成 "/home/runner/aosp"，日志里直接出现
+#     `phase=/home/runner/aosp` 这种一眼看得出问题的值。
+#     所以这里对 phase 做白名单校验，传错立刻报错而不是继续算。
+#
+#  3) 守卫默认只告警（AOSP_FREE_SPACE_GUARD=warn），不硬失败。
+#     原因：AOSP_OUT_ESTIMATE_GB 是**估计值**，不是实测值。
+#     拿估计值硬性否决构建，估偏了就会拒掉本来能跑通的流水线；
+#     而"磁盘真写满"这个真实风险，由编译过程监控磁盘 + 优雅停止来兜
+#     （见 compile_shard.sh 的 build_with_budget 里的磁盘监控）。
+#     需要硬失败时显式设 AOSP_FREE_SPACE_GUARD=1。
+#
+#  AOSP 10 `--depth=1` 源码实测 63~64GB（AOSP_SOURCE_ESTIMATE_GB）。
+# =============================================================================
+AOSP_SOURCE_ESTIMATE_GB="${AOSP_SOURCE_ESTIMATE_GB:-64}"
 
 project_build_capacity() {
   local phase="${1:-post_sync}"
   local p="${2:-$AOSP_SRC_DIR}"
+
+  # 参数顺序自检：phase 只允许两个合法值
+  case "$phase" in
+    pre_sync|post_sync) : ;;
+    *)
+      err "project_build_capacity 第 1 个参数必须是 pre_sync|post_sync，收到: '${phase}'"
+      err "调用方可能还在用旧签名。正确用法："
+      err "  project_build_capacity post_sync \"\$AOSP_SRC_DIR\""
+      exit 1
+      ;;
+  esac
+
   banner "容量守卫（阶段=${phase}）"
 
   local out; out="$(aosp_out)"
-  local avail src_gb out_now_gb out_need swap_gb need_gb src_side
+  local avail src_gb out_now_gb out_need need_gb
   avail="$(avail_gb "$p")"
   src_gb="$(du_gb "$AOSP_SRC_DIR" --exclude=out)"
-
-  # swap：只有"已经落盘的文件"才计入；尚未创建的按 0 算（理由见文件头注释）
-  swap_gb=0
-  if [ -e "$AOSP_SWAP_FILE" ]; then
-    swap_gb="$(du_gb "$AOSP_SWAP_FILE")"
-  fi
-
-  # out 满负荷估计 vs 现状，取增量
   out_now_gb="$(du_gb "$out")"
   out_need=$(( AOSP_OUT_ESTIMATE_GB - out_now_gb ))
   [ "$out_need" -lt 0 ] && out_need=0
 
+  # 需求侧：严格遵守"不重复计入已落盘的东西"
   if [ "$phase" = "pre_sync" ]; then
-    src_side=$AOSP_SOURCE_ESTIMATE_GB      # 源码还没落盘，全额计入需求
-    need_gb=$(( src_side + out_now_gb + out_need ))
+    need_gb=$(( AOSP_SOURCE_ESTIMATE_GB + out_now_gb + out_need ))   # 源码未落盘，全额计
   else
-    src_side=0                            # 源码已落盘，df 的 avail 里已经扣过了
-    need_gb=$(( swap_gb + out_need ))
+    need_gb=$(( out_need ))                                            # 源码/swap 均已落盘
   fi
 
-  log "  分区可用       : ${avail}GB"
-  log "  AOSP 源码(实测): ${src_gb}GB"
   if [ "$phase" = "pre_sync" ]; then
-    log "  源码计入需求   : 是（按估计 ${AOSP_SOURCE_ESTIMATE_GB}GB，尚未落盘）"
+    log "  源码计入需求   : 是（${AOSP_SOURCE_ESTIMATE_GB}GB，尚未落盘）"
   else
     log "  源码计入需求   : 否（已落盘，已从 avail 中扣除）"
   fi
-  log "  swap 已落盘    : ${swap_gb}GB (mode=${AOSP_SWAP_MODE:-auto}; zram 不占盘)"
+  log "  分区可用       : ${avail}GB"
+  log "  AOSP 源码(实测): ${src_gb}GB"
+  log "  swap 计入需求  : 0GB（zram 不占盘；swap 文件已落盘也已从 avail 扣除）"
   log "  out 现状/估计  : ${out_now_gb}GB / ${AOSP_OUT_ESTIMATE_GB}GB  -> 还需 ${out_need}GB"
   log "  本阶段需求合计 : ${need_gb}GB"
+  log "  余量           : $(( avail - need_gb ))GB"
 
   {
     echo "phase=${phase}"
@@ -326,12 +363,13 @@ project_build_capacity() {
     echo "source_measured_gb=${src_gb}"
     echo "source_estimate_gb=${AOSP_SOURCE_ESTIMATE_GB}"
     echo "source_counted_in_need=$([ "$phase" = pre_sync ] && echo yes || echo no)"
-    echo "swap_on_disk_gb=${swap_gb}"
+    echo "swap_counted_in_need=no"
     echo "out_now_gb=${out_now_gb}"
     echo "out_estimate_gb=${AOSP_OUT_ESTIMATE_GB}"
     echo "out_need_extra_gb=${out_need}"
     echo "need_gb=${need_gb}"
     echo "slack_gb=$(( avail - need_gb ))"
+    echo "guard_mode=${AOSP_FREE_SPACE_GUARD:-warn}"
     echo "shard=${AOSP_SHARD_INDEX:-1}/${AOSP_SHARD_TOTAL:-1}"
   } > "${CI_LOG_DIR}/capacity-projection.txt"
 
@@ -341,19 +379,25 @@ project_build_capacity() {
   fi
 
   local gap=$(( need_gb - avail ))
-  err "容量不足：缺 ${gap}GB（本阶段需求 ${need_gb}GB > 可用 ${avail}GB）"
-  err "实测余量参考：回收磁盘后 ~112GB 可用 - 源码 63GB = 49GB 给 out"
-  err "按影响从大到小的处理顺序："
-  err "  1) 确认 AOSP_RECLAIM_DISK=1 —— 回收预装 Android SDK/dotnet/swift 省 ~25GB"
-  err "  2) 换大磁盘 runner：self-hosted（本仓库 runs-on 已参数化，改一处即可）"
-  err "     已实测 ubuntu-22.04-large/2xlarge/4xlarge 在本账号不会被调度（一直 queued）"
-  err "  3) 加 --prune-source 裁剪无关源码（每项约省 1~4GB，需自行确认不参与目标图）"
-  err "  4) 调小 AOSP_OUT_ESTIMATE_GB（治标，会让 out 在编译途中写满而半残）"
-  if [ "${AOSP_FREE_SPACE_GUARD:-1}" = "1" ]; then
-    err "守卫开启，直接终止。确认要冒险继续请设 AOSP_FREE_SPACE_GUARD=0（out 可能在编译中损坏）"
-    exit 1
-  fi
-  warn "守卫已关闭，继续执行（out 可能在编译途中因磁盘写满而损坏）"
+  warn "容量可能不足：缺 ${gap}GB（估计值需求 ${need_gb}GB vs 可用 ${avail}GB）"
+  warn "实测参考：回收磁盘后 ~112GB 可用 - 源码 ${src_gb}GB = 留给 out ~${avail}GB"
+  warn "注意：AOSP_OUT_ESTIMATE_GB=${AOSP_OUT_ESTIMATE_GB} 是**估计值**，可能偏保守。"
+  warn "     默认放行；编译过程会监控磁盘，低于 ${AOSP_DISK_STOP_GB:-5}GB 时优雅停止，"
+  warn "     不会写出半残的 out。"
+  warn "想省空间，按效果排序："
+  warn "  1) 确认 AOSP_RECLAIM_DISK=1（回收预装 Android SDK/dotnet/swift，已省 ~25GB）"
+  warn "  2) AOSP_SWAP_MODE=auto 时 zram 不可用会自动跳过 swap 文件（省 5~6GB 给 out）"
+  warn "  3) 换大磁盘 runner：self-hosted（本仓库 runs-on 已参数化，改一处即可）"
+  warn "     已实测 ubuntu-22.04-large/2xlarge/4xlarge 在本账号不会被调度（一直 queued）"
+  warn "  4) 加 --prune-source 裁剪无关源码（每项约省 1~4GB，需自行确认不参与目标图）"
+
+  case "${AOSP_FREE_SPACE_GUARD:-warn}" in
+    1)   err "守卫模式=1(硬失败)，终止。设成 warn 可改为告警放行"; exit 1 ;;
+    0)   : ;;
+    warn) : ;;
+    *)    warn "未知的 AOSP_FREE_SPACE_GUARD='${AOSP_FREE_SPACE_GUARD}'，按 warn 处理" ;;
+  esac
+  log "守卫放行，继续（编译过程会监控磁盘：低于 ${AOSP_DISK_STOP_GB:-5}GB 时优雅停止）"
 }
 
 # =============================================================================

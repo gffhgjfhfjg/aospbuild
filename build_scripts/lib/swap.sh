@@ -156,25 +156,32 @@ create_swap() {
       # auto：先建 zram（不占磁盘，这是最优解）
       setup_zram "$size_gb" && have_zram=1 || warn "zram 不可用，转而评估 swap 文件"
       if [ "$have_zram" -eq 0 ]; then
-        # zram 拿不到时的策略：**先把 out 需要的空间留足，剩余才拿来做 swap。**
-        # 反过来做（先给 swap 16GB）会必然失败：
-        #   实测 磁盘剩 49GB / out 需 ~42GB —— 若再建 16GB swap，out 只剩 33GB，
-        #   容量守卫会直接判死。swap 是防 OOM 的保险，out 是编译的硬需求，
-        #   冲突时必须优先保 out。
-        local slack=$(( avail - AOSP_OUT_ESTIMATE_GB - 2 ))
-        [ "$slack" -lt 0 ] && slack=0
-        local wsize="$size_gb"
-        [ "$slack" -lt "$wsize" ] && wsize="$slack"
-        if [ "$wsize" -ge 2 ]; then
-          log "磁盘剩余 ${avail}GB，扣掉 out 需要的 ${AOSP_OUT_ESTIMATE_GB}GB 后仍可挤出 ${wsize}GB swap 文件"
-          have_file=1
-          size_gb="$wsize"
+        # zram 拿不到时，默认**不建 swap 文件**，把这块空间留给 out。
+        #
+        # 理由（run 36972642241 的实测数据支撑）：
+        #   回收磁盘后 ~112GB 可用 - 源码 64GB = ~48GB 给 out
+        #   若再建一个 5~6GB swap 文件，out 就只剩 42GB，而 aosp_arm64-eng 的
+        #   out 估计需要 40GB+ —— 余量被吃到几乎为零，容量守卫直接告警。
+        #   而 -j1 串行编译时同时只跑一个 clang/javac，15GiB 物理内存
+        #   + 3GiB 预置 swap 通常足够；swap 只是保险，不值得拿 out 的余量去换。
+        # 需要时用 AOSP_SWAP_MODE=file/both 或 AOSP_SWAP_FALLBACK_FILE=1 显式开启。
+        if [ "${AOSP_SWAP_FALLBACK_FILE:-0}" = "1" ]; then
+          local slack=$(( avail - AOSP_OUT_ESTIMATE_GB - 2 ))
+          [ "$slack" -lt 0 ] && slack=0
+          local wsize="$size_gb"
+          [ "$slack" -lt "$wsize" ] && wsize="$slack"
+          if [ "$wsize" -ge 2 ]; then
+            log "磁盘剩余 ${avail}GB，扣掉 out 需要的 ${AOSP_OUT_ESTIMATE_GB}GB 后可挤出 ${wsize}GB swap 文件"
+            have_file=1
+            size_gb="$wsize"
+          else
+            warn "磁盘剩余 ${avail}GB，扣掉 out 后已无余量（slack=${slack}GB），不建 swap 文件"
+          fi
         else
-          warn "磁盘剩余 ${avail}GB，扣掉 out 需要的 ${AOSP_OUT_ESTIMATE_GB}GB 后已无余量（slack=${slack}GB）"
-          warn "-> 不额外创建 swap。理由：swap 只是防 OOM 的保险，而 out 是编译硬需求；"
-          warn "   此时建 swap 只会把 out 挤死，容量守卫也会直接判死。"
-          warn "   runner 自带 15GiB 物理内存 + 3GiB 预置 swap，且 AOSP_BUILD_JOBS=1 串行编译"
-          warn "   同时只跑一个 clang/javac，内存压力远低于并行构建。"
+          warn "zram 不可用，且 AOSP_SWAP_FALLBACK_FILE 未开启 -> 不建 swap 文件（把空间留给 out）"
+          warn "  依据：runner 自带 15GiB 物理内存 + 3GiB 预置 swap；AOSP_BUILD_JOBS=1 串行编译时"
+          warn "        同时只跑一个 clang/javac，内存压力远低于并行构建。"
+          warn "  若确实需要额外 swap 文件：设 AOSP_SWAP_FALLBACK_FILE=1（会从 out 的余量里扣）"
         fi
       elif [ "$avail" -ge $(( file_need + ${AOSP_OUT_ESTIMATE_GB:-45} )) ]; then
         have_file=1
