@@ -133,6 +133,12 @@ main() {
 
   # ---------------------------------------------------------------- 6) 结果核验
   banner "Stage1 编译结果核验"
+
+  # 6a) 宿主工具冒烟测试 —— 在这里做最划算：
+  #     此时 out/host/linux-x86/bin 里已经有 metalava / mksquashfs / mke2fs / avbtool 等，
+  #     如果它们缺共享库，现在发现只需几分钟；等 Job4 打包时才发现要浪费 8 小时。
+  smoke_test_prebuilt_tools "$AOSP_SRC_DIR" "$(aosp_out)/host/linux-x86/bin"
+
   local prod; prod="$(aosp_product)"
   log "产物目录: ${prod}"
   ls -la "$prod" 2>/dev/null | head -n 60 || warn "产物目录不存在"

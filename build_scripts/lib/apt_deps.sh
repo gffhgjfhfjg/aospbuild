@@ -45,8 +45,14 @@ APT_PKGS_CORE=(
   libgmp3-dev
   liblz4-tool
   libcurl4-openssl-dev
-  libiostream-dev
   libsdl1.2-dev
+  # --- AOSP 10 prebuilt 依赖的 ncurses5 ABI ---
+  # AOSP 自带的 clang-3289846 / 部分 host 工具是链接 libncurses.so.5 /
+  # libtinfo.so.5 编译的，而 Ubuntu 22.04 默认只提供 .so.6。
+  # 缺了会报 "error while loading shared libraries: libncurses.so.5"，
+  # 整个 ARM64 交叉编译直接不可用。22.04 的 apt 源里这两个包还在。
+  libncurses5
+  libtinfo5
   lzop
   pngcrush
   rsync
@@ -159,6 +165,9 @@ install_apt_deps() {
   # ---- 字符集 / 时区，避免 soong & metalava 输出乱码 ----
   locale_gen_utf8
 
+  # ---- AOSP 10 prebuilt 依赖的 ncurses5 ABI（缺了 clang 根本起不来）----
+  ensure_ncurses5_abi
+
   # ---- repo launcher（apt 的 repo 包太老，必须用官方版）----
   install_repo_launcher
 
@@ -240,14 +249,71 @@ setup_java11() {
 }
 
 # =============================================================================
+# ncurses5 ABI 兜底
+# -----------------------------------------------------------------------------
+# AOSP 10 自带的 prebuilts（尤其 clang-3289846）是链接 libncurses.so.5 /
+# libtinfo.so.5 的老 ABI，Ubuntu 22.04 默认只有 .so.6。
+# 缺了会在编译真正开始时才炸，必须在这里就保证存在。
+#
+# 已在 ubuntu-22.04 (image 20260927.309) 实测：
+#   apt-cache policy libncurses5 -> Candidate: 6.3-2ubuntu0.3，apt install 成功，
+#   安装后 /usr/lib/x86_64-linux-gnu/libncurses.so.5 -> libncurses.so.5.9 存在。
+#   （focal 的 libncurses5_6.2-0ubuntu2_amd64.deb 直链已 404，不要依赖）
+#
+# 三级兜底：apt 安装 -> 软链 .so.6 -> 明确报错
+# =============================================================================
+ensure_ncurses5_abi() {
+  local libdir="/usr/lib/x86_64-linux-gnu"
+  local need_ok=0
+
+  # 1) 直接用 apt 装（首选，ABI 正确）
+  local SUDO=""
+  [ "$(id -u)" -ne 0 ] && SUDO="sudo"
+  log "确保 ncurses5 ABI 可用 (libncurses.so.5 / libtinfo.so.5) ..."
+  $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+       libncurses5 libtinfo5 >/dev/null 2>&1 || true
+  $SUDO ldconfig 2>/dev/null || true
+
+  if [ -e "$libdir/libncurses.so.5" ]; then
+    log "  libncurses.so.5 就绪 (apt)"
+    need_ok=1
+  fi
+
+  # 2) 兜底：软链 .so.6 -> .so.5（ABI 不完全兼容，clang 只用基础 terminfo 调用时可行）
+  if [ "$need_ok" -eq 0 ]; then
+    warn "  apt 未提供 libncurses.so.5，尝试软链 .so.6 作为兜底"
+    local pair
+    for pair in "libncursesw.so.6:libncurses.so.5" \
+                "libncurses.so.6:libncurses.so.5" \
+                "libtinfo.so.6:libtinfo.so.5"; do
+      local src="${pair%%:*}" dst="${pair##*:}"
+      if [ ! -e "$libdir/$dst" ] && [ -e "$libdir/$src" ]; then
+        $SUDO ln -sf "$libdir/$src" "$libdir/$dst" && log "  软链 $dst -> $src"
+      fi
+    done
+    $SUDO ldconfig 2>/dev/null || true
+    [ -e "$libdir/libncurses.so.5" ] && need_ok=1
+  fi
+
+  if [ "$need_ok" -eq 1 ]; then
+    log "ncurses5 ABI 准备完成"
+    return 0
+  fi
+
+  err "无法提供 libncurses.so.5 —— AOSP 10 自带的 clang 将无法启动："
+  err "  error while loading shared libraries: libncurses.so.5"
+  err "当前系统: $(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")"
+  err "请改用 ubuntu-22.04（22.04 的 apt 源里有 libncurses5），"
+  err "或把仓库变量 AOSP_RUNNER_OS 指向一个自带 libncurses5 的镜像。"
+  return 1
+}
+
+# =============================================================================
 # repo launcher 安装
 # -----------------------------------------------------------------------------
 #  必须装官方最新 launcher，不能用 apt 的 repo 包：
 #    Ubuntu 22.04 的 repo 包是 2.17（2020 年），缺 --git-lfs 等新选项，
 #    会直接 "repo: error: no such option: --git-lfs" 让 repo init 失败。
-#    Ubuntu 24.04 的更老（实测 2.36 但也没 --git-lfs？见 run 36948461975 的实际情况，
-#    无论如何官方 launcher 最稳）。
-#  官方安装方式：https://gerrit.googlesource.com/git-repo/+master/README.md
 # =============================================================================
 install_repo_launcher() {
   local bindir="${1:-$HOME/bin}"
@@ -278,43 +344,171 @@ install_repo_launcher() {
 }
 
 # =============================================================================
-# 交叉编译工具链自检：确认 arm64 目标工具链存在于源码树中
+# 交叉编译工具链自检
+# -----------------------------------------------------------------------------
+#  这里是「早失败」的关键位置。
+#  历史教训：clang 缺 libncurses.so.5 起不来时，这里只 WARN「一般无害」，
+#  结果白等 1 小时进入 ninja 才炸。现在任何 prebuilt 跑不起来都直接 die。
 # =============================================================================
 verify_cross_toolchain() {
-  banner "ARM64 交叉编译工具链自检"
   local root="${1:-$AOSP_SRC_DIR}"
-  local found=0
+  local fatal=0
+  banner "ARM64 交叉编译工具链自检"
 
-  # 1) AOSP 自带 clang（真正给 arm64 目标编译的就是它）
+  # ---------- 1) AOSP 自带 clang（真正给 arm64 目标编译的就是它）----------
   local clang
   clang="$(ls -d "$root"/prebuilts/clang/host/linux-x86/clang-* 2>/dev/null | head -n1 || true)"
-  if [ -n "$clang" ]; then
-    log "找到 clang 工具链: $clang"
-    if [ -x "$clang/bin/clang" ]; then
-      log "clang 版本: $("$clang/bin/clang" --version | head -n1)"
-      "$clang/bin/clang" --target=aarch64-linux-android10 --version >/dev/null 2>&1 \
-        && log "aarch64-linux-android 目标可用 ✓" \
-        || warn "clang 无法以 aarch64-linux-android10 目标运行（一般无害）"
-    fi
-    found=1
+  if [ -z "$clang" ]; then
+    err "未找到 AOSP 自带 clang：${root}/prebuilts/clang/host/linux-x86/clang-*"
+    err "请确认 repo sync 完整（prebuilts/clang 是否同步下来）"
+    exit 1
+  fi
+  log "clang 工具链: $clang"
+
+  if [ ! -x "$clang/bin/clang" ]; then
+    err "clang 不可执行: ${clang}/bin/clang"
+    exit 1
   fi
 
-  # 2) AOSP 自带 aarch64 GNU 工具链（部分 libcutils/sanitizer 目标会用到）
+  # --version 失败通常意味着缺共享库（AOSP 10 最常见的是 libncurses.so.5）
+  local cver
+  if ! cver="$("$clang/bin/clang" --version 2>&1)"; then
+    err "clang 无法启动："
+    printf '%s\n' "$cver" | head -n 5 >&2
+    local miss
+    miss="$(printf '%s\n' "$cver" | grep -oE 'lib[a-zA-Z0-9_.+-]*\.so[0-9.]*' | head -n1 || true)"
+    [ -n "$miss" ] && err "缺失的共享库: ${miss}"
+    err "修复方向：安装对应的老 ABI 包（22.04 上 libncurses5 / libtinfo5 可直接 apt 装）"
+    fatal=1
+  else
+    log "clang 版本: $(printf '%s\n' "$cver" | head -n1)"
+  fi
+
+  # aarch64 目标必须能真正编译出目标文件
+  if [ "$fatal" -eq 0 ]; then
+    if "$clang/bin/clang" --target=aarch64-linux-android10 -x c -c /dev/null -o /dev/null 2>/dev/null; then
+      log "aarch64-linux-android10 目标编译可用 ✓"
+    else
+      err "clang 无法以 aarch64-linux-android10 目标编译 —— ARM64 交叉编译不可用"
+      fatal=1
+    fi
+  fi
+
+  # ---------- 2) soong 自带 ninja ----------
+  local ninja
+  ninja="$(ls -d "$root"/prebuilts/build-tools/linux-x86/bin/ninja 2>/dev/null | head -n1 || true)"
+  if [ -x "$ninja" ]; then
+    log "ninja: $ninja ($("$ninja" --version 2>&1 | head -n1))"
+    # @file 响应文件支持检测（stage1 依赖它来排除 metalava）
+    if "$ninja" --help 2>&1 | grep -q '@file'; then
+      log "ninja 支持 @file 响应文件 ✓"
+    else
+      warn "ninja 不支持 @file，stage1 将回退到 AOSP_NINJA_TARGETS_MODE=xargs"
+    fi
+  else
+    err "未找到 ninja: ${root}/prebuilts/build-tools/linux-x86/bin/ninja"
+    fatal=1
+  fi
+
+  # ---------- 3) aarch64 GNU 工具链（部分目标会用到）----------
   local gcc
   gcc="$(ls -d "$root"/prebuilts/gcc/linux-x86/aarch64/*/bin 2>/dev/null | head -n1 || true)"
   if [ -n "$gcc" ] && [ -x "$gcc/aarch64-linux-android-gcc" ]; then
-    log "找到 aarch64 GNU 工具链: $gcc"
-    found=1
+    log "aarch64 GNU 工具链: $gcc"
+  else
+    logv "未找到 aarch64 GNU 工具链（AOSP 10 以 clang 为主，非必需）"
   fi
 
-  # 3) soong 自带 ninja / clang 依赖
-  local ninja
-  ninja="$(ls -d "$root"/prebuilts/build-tools/linux-x86/bin/ninja 2>/dev/null | head -n1 || true)"
-  [ -x "$ninja" ] && { log "找到 ninja: $ninja"; found=1; }
+  # ---------- 4) JDK 11（AOSP 10 硬要求）----------
+  if [ -x "$root/prebuilts/jdk/jdk11/bin/javac" ]; then
+    log "AOSP 自带 JDK: $("$root/prebuilts/jdk/jdk11/bin/javac" -version 2>&1 | head -n1)"
+  else
+    warn "未找到 prebuilts/jdk/jdk11，改用系统 JDK"
+    local jv
+    jv="$(java -version 2>&1 | head -n1 || true)"
+    log "系统 JDK: ${jv:-<无 java>}"
+    case "$jv" in
+      *\"11.*) : ;;
+      *) warn "系统 JDK 不是 11，AOSP 10 可能出现 UnsupportedClassVersionError" ;;
+    esac
+  fi
 
-  [ "$found" -eq 1 ] || die "未在 ${root} 找到任何 ARM64 交叉编译工具链，请确认 repo sync 完整（prebuilts/clang 是否 sync）"
+  if [ "$fatal" -ne 0 ]; then
+    echo
+    err "=========================================================="
+    err " 交叉编译工具链自检未通过 —— 继续编译只会浪费时间"
+    err " 常见根因："
+    err "   1) 缺 libncurses.so.5（Ubuntu 22.04 需 apt install libncurses5 libtinfo5）"
+    err "   2) runner 镜像太新（24.04/26 的 glibc 与 AOSP 10 prebuilt 不兼容）"
+    err "      -> 把仓库变量 AOSP_RUNNER_OS 固定为 ubuntu-22.04"
+    err "   3) repo sync 不完整，prebuilts/clang 没拉下来"
+    err "=========================================================="
+    exit 1
+  fi
 
-  log "交叉编译工具链自检通过"
+  log "交叉编译工具链自检通过 ✓"
+}
+
+# =============================================================================
+# AOSP prebuilt 宿主工具冒烟测试
+# -----------------------------------------------------------------------------
+# 这些工具在打包阶段（Job4）会被直接 exec 起来：
+#   mksquashfs / mke2fs / simg2img / avbtool / aapt2 / zipalign / metalava ...
+# 如果它们缺共享库，要到 Job4 才炸（那时已经编了 8 小时）。
+# 这里提前把能跑的都跑一遍，缺什么立刻暴露。
+# =============================================================================
+smoke_test_prebuilt_tools() {
+  local root="${1:-$AOSP_SRC_DIR}"
+  local bindir="${2:-$root/out/host/linux-x86/bin}"
+  banner "AOSP prebuilt 宿主工具冒烟测试"
+
+  if [ ! -d "$bindir" ]; then
+    warn "未找到 ${bindir}（编译前应为空），跳过冒烟测试"
+    return 0
+  fi
+
+  # (工具名:传什么参数能让它快速退出)
+  local probes=(
+    "metalava:version"
+    "mksquashfs:-version"
+    "mke2fs:-V"
+    "simg2img:-h"
+    "avbtool:version"
+    "aapt2:version"
+    "zipalign:-h"
+    "dexdump:-h"
+    "ninja:--version"
+    "soong_build:version"
+  )
+  local e name arg bad=0 ok=0 skipped=0 msg bin
+  for e in "${probes[@]}"; do
+    name="${e%%:*}"
+    arg="${e##*:}"
+    bin="${bindir}/${name}"
+    if [ ! -x "$bin" ]; then
+      logv "  [SKIP] ${name}（本次未构建）"
+      skipped=$((skipped+1))
+      continue
+    fi
+    # 工具的 --help/--version 一般返回非 0；只要不是"缺动态库/loader 错误"就算过
+    msg="$( { "$bin" "$arg" 2>&1 || true; } | head -n 3 )"
+    if printf '%s' "$msg" | grep -qiE 'error while loading shared object|cannot open shared object|not a dynamic executable'; then
+      err "  [FAIL] ${name}: 缺动态库或 loader 错误"
+      printf '         %s\n' "$msg" >&2
+      bad=$((bad+1))
+    else
+      log "  [ OK ] ${name}"
+      ok=$((ok+1))
+    fi
+  done
+
+  log "冒烟测试: ok=${ok} fail=${bad} skipped=${skipped}"
+  if [ "$bad" -gt 0 ]; then
+    err "有 ${bad} 个 AOSP 宿主工具无法启动，Job4 打包阶段必然失败。"
+    err "用 ldd 查具体缺哪个库，例如：ldd ${bindir}/metalava | grep 'not found'"
+    exit 1
+  fi
+  log "宿主工具冒烟测试通过 ✓"
 }
 
 # 显式导出交叉编译环境变量（给宿主侧工具/自研脚本使用；soong 内部不依赖这些）
