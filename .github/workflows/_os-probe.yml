@@ -7,7 +7,7 @@ on:
       probe:
         description: 'what to probe'
         required: false
-        default: 'disk'
+        default: 'ncurses'
 
 permissions:
   contents: read
@@ -17,42 +17,47 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     steps:
-      - name: 环境信息
+      - name: ncurses / clang 依赖探测
         run: |
           set -euo pipefail
-          echo "### OS"
-          grep -E 'PRETTY_NAME|VERSION_ID' /etc/os-release
-          echo "### TOOLCHAIN"
-          for c in gcc g++ clang python3 java; do
-            printf '%-8s : ' "$c"
-            ("$c" --version 2>&1 | head -n1) || echo "NOT FOUND"
+          echo "### 已安装的相关包"
+          for p in libncurses5 libncurses5-dev libncurses6 libncursesw6 libtinfo5 libtinfo6 \
+                   lib32ncurses5 lib32tinfo5; do
+            printf '%-20s ' "$p"
+            dpkg-query -W -f='${Status} ${Version}\n' "$p" 2>/dev/null || echo "NOT INSTALLED"
           done
-          echo "### DISK TOTAL"
-          df -hT /
 
-      - name: 磁盘占用 TOP 30（找可回收的肥肉）
-        run: |
-          set -euo pipefail
-          echo "### TOP-LEVEL / (du, 1 level)"
-          sudo du -x -h -d1 / 2>/dev/null | sort -h | tail -30
           echo
-          echo "### TOP-LEVEL /home/runner"
-          du -x -h -d1 /home/runner 2>/dev/null | sort -h | tail -20
+          echo "### 磁盘上现存的 ncurses/tinfo so"
+          ls -l /usr/lib/x86_64-linux-gnu/ 2>/dev/null | grep -E 'ncurses|tinfo' || echo "(none)"
+
           echo
-          echo "### KNOWN RECLAIMABLE CANDIDATES"
-          for p in /usr/local/lib/android /opt/hostedtoolcache /opt/ghc \
-                   /usr/share/dotnet /usr/local/share/boost /usr/local/graalvm \
-                   /usr/share/swift /opt/azcmt-agent /opt/pipx /usr/local/lib/node_modules; do
-            if [ -e "$p" ]; then
-              printf '%-34s ' "$p"
-              sudo du -x -sh "$p" 2>/dev/null | cut -f1
-            fi
+          echo "### apt 候选版本"
+          for p in libncurses5 libtinfo5 libncurses-dev; do
+            printf '%-16s : ' "$p"
+            apt-cache policy "$p" 2>/dev/null | sed -n '3p' | tr -s ' ' || echo "no candidate"
           done
+
           echo
-          echo "### ANDROID ENV"
-          env | grep -iE 'android|sdk|java_home' || echo "(no ANDROID_* env)"
+          echo "### 尝试安装 libncurses5 (64位)"
+          sudo apt-get update -qq >/dev/null 2>&1 || true
+          if sudo apt-get install -y --no-install-recommends libncurses5 2>&1 | tail -3; then
+            echo "RESULT=apt-install-OK"
+          else
+            echo "RESULT=apt-install-FAILED"
+          fi
+          ls -l /usr/lib/x86_64-linux-gnu/libncurses.so.5* 2>/dev/null || echo "still no libncurses.so.5"
+
           echo
-          echo "### DISK AFTER CANDIDATE RECLAIM (dry run, nothing deleted)"
-          before=$(df -BG --output=avail / | tail -n1 | tr -dc '0-9')
-          echo "avail_before_GB=$before"
-          echo "(未真实删除，仅统计；真实回收在 prepare_runner.sh 的 reclaim_runner_disk)"
+          echo "### 测试 1: 直接跑一个需要 libncurses.so.5 的小程序"
+          printf '#include <curses.h>\nint main(){return 0;}\n' > /tmp/c.c
+          echo "### 测试 2: 软链 libtinfo.so.6 -> libncurses.so.5 后能否满足 clang"
+          if [ ! -e /usr/lib/x86_64-linux-gnu/libncurses.so.5 ]; then
+            sudo ln -sf /usr/lib/x86_64-linux-gnu/libncursesw.so.6 /usr/lib/x86_64-linux-gnu/libncurses.so.5
+            sudo ldconfig
+            echo "symlink created"
+          fi
+          ls -l /usr/lib/x86_64-linux-gnu/libncurses.so.5 2>/dev/null || echo "no symlink"
+          echo "### focal libncurses5 deb 直链是否可达"
+          curl -sI -o /dev/null -w "focal_deb_http=%{http_code}\n" \
+            http://archive.ubuntu.com/ubuntu/pool/main/n/ncurses/libncurses5_6.2-0ubuntu2_amd64.deb || true
