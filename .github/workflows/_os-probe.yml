@@ -1,0 +1,48 @@
+name: _os-probe
+
+# 仅手动触发的环境探针，不参与 main 推送的自动构建
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        # 同时探测 latest 与 22.04，方便对比
+        os: [ubuntu-latest, ubuntu-22.04]
+    steps:
+      - name: 环境信息
+        run: |
+          set -euo pipefail
+          echo "### RUNNER_IMAGE=${RUNNER_IMAGE:-unknown}"
+          echo "### OS_RELEASE"
+          cat /etc/os-release
+          echo "### KERNEL"
+          uname -a
+          echo "### CPU/MEM"
+          nproc; free -h
+          echo "### DISK"
+          df -hT
+          echo "### TOOLCHAIN"
+          for c in gcc g++ clang python python3 java zstd tar; do
+            printf '%-8s : ' "$c"
+            command -v "$c" >/dev/null 2>&1 && ("$c" --version 2>&1 | head -n1) || echo "NOT FOUND"
+          done
+          echo "### KEY 32BIT LIBS (AOSP10 硬依赖)"
+          for p in lib32z1 lib32ncurses5 lib32readline-dev libtinfo5 zlib1g-dev:i386 \
+                   libssl-dev:i386 libc6-dev-i386 pngcrush schedtool squashfs-tools \
+                   python-is-python3 openjdk-11-jdk openjdk-8-jdk libiostream-dev; do
+            printf '%-24s : ' "$p"
+            dpkg-query -W -f='${Status} ${Version}\n' "$p" 2>/dev/null || echo "NOT INSTALLED"
+          done
+          echo "### apt 可用性"
+          for p in lib32z1 lib32ncurses5 libtinfo5 pngcrush openjdk-11-jdk libiostream-dev; do
+            printf '%-20s : ' "$p"
+            apt-cache policy "$p" 2>/dev/null | sed -n '2p' | tr -d ' ' || echo "N/A"
+          done
