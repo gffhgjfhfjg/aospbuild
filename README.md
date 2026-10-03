@@ -85,18 +85,49 @@ dist_images/*.img                          # 最终 ARM64 镜像
 ### 关键实现说明
 
 **排除 metalava 的做法**（`build_scripts/lib/ninja_targets.sh`）
-`ninja` 本身不支持「排除某目标」，所以脚本先 `m nothing` 生成 `out/soong/build.ninja`，
+`ninja` 本身不支持「排除某目标」，所以脚本先 `m nothing` 生成构建图，
 再用 `ninja -t targets all` 导出全量目标清单，用正则筛出 metalava 相关目标写入
 `.ninja_targets_exclude.txt`，剩余写入 `.ninja_targets_keep.txt`，
 最后用 `ninja @out/.stage1_targets.rsp` 精确构建保留目标（响应文件方式，避免命令行长度溢出）。
 清单落在 `out/.ninja_targets_*.txt`，失败时可直接复盘。
+
+**必须显式 `-f` 指定 ninja 入口文件**（AOSP 10 的坑，run 36991148496）
+AOSP 10 的 soong_ui **不生成** `out/build.ninja`，它生成的是
+`out/combined<katiSuffix>.ninja`（`katiSuffix = "-<TARGET_PRODUCT>"`，
+aosp_arm64 下即 `out/combined-aosp_arm64.ninja`）。该文件很短，只是三行 `subninja`：
+
+```
+builddir = <out 绝对路径>
+build _kati_always_build_: phony
+subninja <out>/build-aosp_arm64.ninja           # kati 主体
+subninja <out>/build-aosp_arm64-package.ninja   # kati 打包
+subninja <out>/soong/build.ninja                # soong 图（约 1GB）
+```
+
+`ninja` 不带 `-f` 时默认读 `./build.ninja`，于是任何 `ninja -C "$out" ...`
+都会直接失败：
+
+```
+ninja: Entering directory `.../out'
+ninja: error: loading 'build.ninja': No such file or directory
+```
+
+因为 `out/soong/build.ninja` 确实存在（1GB+），日志里很容易误判成
+「soong 没生成构建图」，实际只是入口文件名不对。
+仓库里所有 ninja 调用都通过 `common.sh` 的 `require_ninja_manifest()`
+取入口文件并显式传 `-f`；`selfcheck.sh` 的 `[3b/4]` 项会拦截任何漏加 `-f` 的调用。
+
+>顺带纠正一个历史误判：AOSP 10 自带的 ninja 1.8.2 **是支持** `-t targets all` 的
+>（`src/ninja.cc` 的 `NinjaMain::ToolTargets` 里有 `mode == "all"` 分支）。
+> 之前「只拿到 0 个目标 => ninja 版本太老」的结论是错的，0 个的真正原因就是上面这个 `-f` 缺失。
 
 排除正则除了 `metalava` / `update-api` / `check-api` / `api-versions` 这些显式目标，
 **还必须排除 metalava 的输出文件本身**（`*/api/current.txt`、`*/api/system-current.txt`、
 `*/api/test-current.txt`、`*/api/removed.txt`、`api-versions.xml`、`api-current.txt`）。
 否则这些文件会通过 ninja 的依赖边把 `metalava` 重新拉回 Job2，分段就白做了。
 `all` 与 `clean` 也会一并从 rsp 里剔除（`all` 是 metalava 的总入口）。
-若本机 ninja 不支持 `@file` 响应文件，设 `AOSP_NINJA_TARGETS_MODE=xargs` 走分批回退。
+若本机 ninja 不支持 `@file` 响应文件（AOSP 10 自带的 1.8.2 就是如此），
+脚本会自动切到 `xargs` 分批回退模式，无需手工设 `AOSP_NINJA_TARGETS_MODE`。
 
 **python shebang 修复**（`build_scripts/lib/fix_python_shebang.sh`）
 系统层装 `python-is-python3` 并建 `python -> python3` 软链；源码层把
@@ -552,7 +583,9 @@ aosp_arm64-eng = AOSP generic ARM64 参考产品 (AOSP reference / GSI 风格 ta
 | 现象 | 原因 | 处理 |
 |------|------|------|
 | `bad interpreter: No such file or directory` | python shebang 指向 `python` | `sync_source.sh --fix-python`（脚本已自动执行）；确认 `python-is-python3` 装上 |
-| `ninja: error: unknown target` | 目标清单含 ninja 图里没有的目标 | 改用 `AOSP_NINJA_TARGETS_MODE=xargs` 回退模式 |
+| `ninja: error: loading 'build.ninja': No such file or directory` | ninja 调用漏了 `-f`，AOSP 10 的入口文件是 `out/combined<katiSuffix>.ninja` 而非 `out/build.ninja` | 用 `$(require_ninja_manifest)` 取入口文件；`selfcheck.sh` 的 `[3b/4]` 项会提前拦截 |
+| `ninja: error: unknown target` | 目标清单含 ninja 图里没有的目标 | 确认已执行 `m nothing`；脚本会自动切 `xargs` 分批模式 |
+| `ninja -t targets all` 返回 0 个目标 | 多半是上一条（缺 `-f`），ninja 加载失败后 stderr 被吞 | 看 `out/.ninja_targets_err.txt`；AOSP 10 自带的 ninja 1.8.2 **是支持** `-t targets all` 的 |
 | `ninja: ... Killed` / exit 137 | OOM | 确认 16G swap 生效（`swapon --show`）；调小 `JAVA_TOOL_OPTIONS` 的 `-Xmx` |
 | `patch: **** Only garbage was found in the patch input` | 补丁不是 `a/ b/` 前缀或格式错 | 用 `--howto` 重新生成 |
 | `m installclean` 报错后继续 | out 已是干净状态 | 脚本已降级为 warning，不阻塞 |

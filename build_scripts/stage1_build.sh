@@ -128,6 +128,12 @@ main() {
   #  绝不能按目标名切分 —— 那会破坏依赖顺序或让下游重做上游的活。
   local ninja
   ninja="$(find_ninja)"
+  # ninja 入口文件：AOSP 10 生成的是 combined<katiSuffix>.ninja，
+  # 不带 -f 时 ninja 会去找 out/build.ninja 并报
+  #   ninja: error: loading 'build.ninja': No such file or directory
+  # （run 36991148496 就是死在这里）
+  local ninja_mf
+  ninja_mf="$(require_ninja_manifest)" || die "无法定位 ninja 入口文件"
   local SHARD_T0=$SECONDS
 
   local rsp="$out/.stage1_targets.rsp"
@@ -163,6 +169,7 @@ main() {
       #   正确性不受影响 —— ninja 每次调用都按完整依赖图求解，只是目标集合不同。
       local batch="${AOSP_NINJA_XARGS_BATCH:-4000}"
       log "使用 xargs 分批模式，每批 ${batch} 个目标（ninja 图约 1GB，批越大加载次数越少）"
+      log "ninja 入口文件: ${ninja_mf}"
       local total_batches=$(( (n_rsp + batch - 1) / batch ))
       log "预计调用 ninja ${total_batches} 次"
       local i=0
@@ -171,7 +178,7 @@ main() {
         log "--- 批次 $i/$total_batches ---"
         set +e
         sed -n "$(( (i - 1) * batch + 1 )),$(( i * batch ))p" "$rsp" \
-          | xargs -r "$ninja" -C "$out" -j"$AOSP_BUILD_JOBS" -k "$AOSP_BUILD_KEEP_GOING"
+          | xargs -r "$ninja" -C "$out" -f "$ninja_mf" -j"$AOSP_BUILD_JOBS" -k "$AOSP_BUILD_KEEP_GOING"
         local brc=$?
         set -e
         if [ "$brc" -ne 0 ]; then

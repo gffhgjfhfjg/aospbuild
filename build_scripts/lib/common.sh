@@ -483,6 +483,62 @@ find_ninja() {
   die "找不到 ninja 可执行文件"
 }
 
+# =============================================================================
+#  定位 out 目录下的 ninja 入口文件（combined*.ninja）
+# -----------------------------------------------------------------------------
+#  【为什么必须有这个函数 —— run 36991148496 的失败根因】
+#  AOSP 10 的 soong_ui **不会**生成 out/build.ninja，它生成的是：
+#      out/combined<katiSuffix>.ninja      katiSuffix = "-<TARGET_PRODUCT>"
+#  即 aosp_arm64 产品下是 out/combined-aosp_arm64.ninja。
+#  该文件内容极短（见 build/soong/ui/build/build.go 的 combinedBuildNinjaTemplate）：
+#      builddir = <绝对路径>
+#      build _kati_always_build_: phony
+#      subninja <out>/build-aosp_arm64.ninja          <- kati 主体
+#      subninja <out>/build-aosp_arm64-package.ninja  <- kati 打包
+#      subninja <out>/soong/build.ninja               <- soong 图（约 1GB）
+#
+#  ninja 不带 -f 时默认读 ./build.ninja，于是：
+#      ninja -C out ...
+#      ninja: Entering directory `.../out'
+#      ninja: error: loading 'build.ninja': No such file or directory
+#  直接 exit 1。注意 out/soong/build.ninja 是存在的（1GB+），
+#  所以「文件缺失」只可能是入口文件名不对，不是图没生成。
+#
+#  用法: mf="$(aosp_ninja_manifest)" || die ...   然后 ninja -C "$out" -f "$mf"
+# =============================================================================
+aosp_ninja_manifest() {
+  local out; out="$(aosp_out)"
+  local prod="${TARGET_PRODUCT:-}"
+  local f
+
+  # 1) 优先匹配当前产品（AOSP 9/10）
+  if [ -n "$prod" ] && [ -f "$out/combined-${prod}.ninja" ]; then
+    echo "$out/combined-${prod}.ninja"; return 0
+  fi
+  # 2) kati suffix 可能带额外参数（combined-<product>-<md5>），取最新的一个
+  f="$(ls -1t "$out"/combined*.ninja 2>/dev/null | head -n1 || true)"
+  if [ -n "$f" ] && [ -f "$f" ]; then echo "$f"; return 0; fi
+  # 3) AOSP 8 及更早：入口就叫 build.ninja
+  if [ -f "$out/build.ninja" ]; then echo "$out/build.ninja"; return 0; fi
+
+  return 1
+}
+
+# 同上，但失败时给出可操作的报错信息
+require_ninja_manifest() {
+  local out; out="$(aosp_out)"
+  local mf
+  if mf="$(aosp_ninja_manifest)"; then
+    echo "$mf"; return 0
+  fi
+  err "找不到 out 下的 ninja 入口文件（找过 combined*.ninja 与 build.ninja）"
+  err "out 目录: ${out}"
+  err "请确认本 job 已经成功执行过 'm nothing'（会先生成构建图）"
+  err "out 下现有的 *.ninja 文件："
+  ls -1 "$out"/*.ninja 2>/dev/null | sed 's/^/    /' >&2 || true
+  return 1
+}
+
 # 目标是否在 Makefile 中真实存在（防止 m 报 Unknown target）
 target_exists_in_makefile() {
   local t="$1"

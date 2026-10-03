@@ -102,7 +102,10 @@ main() {
   banner "规划 metalava 任务"
   local all_targets="$out/.ninja_targets_all.txt"
   local ninja; ninja="$(find_ninja)"
-  "$ninja" -C "$out" -t targets all 2>/dev/null | awk -F: '{print $1}' | LC_ALL=C sort -u > "$all_targets"
+  local ninja_mf
+  ninja_mf="$(require_ninja_manifest)" || die "无法定位 ninja 入口文件"
+  "$ninja" -C "$out" -f "$ninja_mf" -t targets all 2>/dev/null \
+    | awk -F: '{print $1}' | LC_ALL=C sort -u > "$all_targets"
   log "ninja 目标总数: $(wc -l < "$all_targets")"
 
   # 用户配置的 metalava 目标列表

@@ -34,21 +34,25 @@ METALAVA_EXTRA_EXCLUDE_RE='(^|[-_/])api-current([-_./]|$)|(^|[-_/])(framework-|h
 # =============================================================================
 # ninja 目标枚举
 # -----------------------------------------------------------------------------
-#  【为什么不能直接用 `ninja -t targets all` —— run 36984465362 实测】
-#  AOSP 10 自带的 ninja 是 prebuilts/build-tools/linux-x86/bin/ninja，
-#  版本 **1.8.2.git**（2018 年）。它有两个限制：
-#     1) `-t targets all` 里的 `all` 被当成"要列出的文件"而不是关键字，
-#        对不存在的文件不输出任何东西 -> 目标总数 0 -> 直接 die
-#     2) 不支持 @file 响应文件（run 里已 WARN 过）
-#  所以这里做两件事：
-#     1) 先试 `ninja -t targets all`，数量明显偏少就回退到**直接解析 build.ninja**
-#     2) 响应文件能力自动探测，不支持就自动走 xargs 分批
+#  【run 36991148496 的两个误判 —— 这次一并纠正】
 #
-#  直接解析是可靠的：soong 生成的 out/soong/build.ninja 里，
-#  形如 `build <name>: phony <deps...>` 的行就是可直接喂给 ninja 的目标。
+#  误判 1:「ninja -t targets all 只拿到 0 个目标 => ninja 1.8.2 太老不支持」
+#    真相: `-t targets all` 在 ninja 1.8.2 里是**支持**的
+#    （src/ninja.cc 的 NinjaMain::ToolTargets 里有 `else if (mode == "all")` 分支）。
+#    拿到 0 个的真正原因是：命令是 `ninja -C "$out" -t targets all`，
+#    没有 -f，于是去找 out/build.ninja —— 而 AOSP 10 根本不生成这个文件，
+#    ninja 直接报错退出，stderr 又被 2>/dev/null 吞掉，看上去就是「0 个目标」。
+#
+#  误判 2:「直接解析 build.ninja 里的 phony 行更可靠，所以一直用它」
+#    巧合能用，但拿到的只是 soong 图的 phony 目标，漏掉 kati 生成的目标。
+#    现在入口文件找对了，`-t targets all` 可以正常用；解析 build.ninja
+#    降级为兜底。
+#
+#  关键点: 所有 ninja 调用都必须带 `-f <combined*.ninja>`，
+#  入口文件由 common.sh 的 aosp_ninja_manifest() 解析。
 # =============================================================================
 
-# 解析 build.ninja 系列文件，取出所有可构建目标名
+# 解析 build.ninja 系列文件，取出所有可构建目标名（兜底路径）
 _ninja_targets_from_buildfiles() {
   local out="$1"
   local ninja_f
@@ -78,28 +82,37 @@ ninja_list_all_targets() {
   [ -f "$out/soong/build.ninja" ] \
     || die "未找到 ${out}/soong/build.ninja，请先执行 'm nothing' 生成 soong 构建图"
 
+  # ---- 入口文件：AOSP 10 是 combined<katiSuffix>.ninja，不是 build.ninja ----
+  local mf
+  mf="$(require_ninja_manifest)" \
+    || die "无法定位 ninja 入口文件（ninja 会去找 out/build.ninja 并失败）"
+
   log "导出 ninja 目标清单（ninja 版本: $("$ninja" --version 2>/dev/null || echo unknown)）"
+  log "ninja 入口文件: ${mf}"
 
   local f="$out/.ninja_targets_all.txt"
 
-  # ---- 尝试路径 1：ninja -t targets ----
+  # ---- 路径 1：ninja -t targets all（正确入口文件下可用）----
   : > "$f"
-  "$ninja" -C "$out" -t targets all 2>/dev/null | awk -F: 'NF>1{print $1}' >> "$f" || true
+  "$ninja" -C "$out" -f "$mf" -t targets all 2>"$out/.ninja_targets_err.txt" \
+    | awk -F: 'NF>1{print $1}' >> "$f" || true
   local n1; n1="$(count_lines "$f")"
 
   if [ "$n1" -ge 50 ]; then
     LC_ALL=C sort -u "$f" -o "$f"
-    log "路径1: ninja -t targets all 可用，得到 ${n1} 个目标"
+    log "路径1: ninja -t targets all 得到 ${n1} 个目标 ✓"
   else
-    # ---- 回退路径：直接解析 build.ninja ----
-    warn "ninja -t targets all 只得到 ${n1} 个目标（该 ninja 版本过老，run 36984465362 实测）"
-    log "回退到直接解析 build.ninja ..."
+    # ---- 兜底路径：直接解析 build.ninja ----
+    err "ninja -t targets all 只得到 ${n1} 个目标（不该发生，请检查入口文件）"
+    if [ -s "$out/.ninja_targets_err.txt" ]; then
+      err "ninja stderr:"
+      head -n 5 "$out/.ninja_targets_err.txt" | sed 's/^/    /' >&2 || true
+    fi
+    warn "回退到直接解析 build.ninja ..."
     : > "$f"
     _ninja_targets_from_buildfiles "$out" | LC_ALL=C sort -u > "$f" 2>/dev/null || true
     local n2; n2="$(count_lines "$f")"
     log "路径2: 解析 build.ninja 得到 ${n2} 个 phony 目标"
-    # 阈值取 10：真实 soong 图的 phony 目标是数千个量级，
-    # 只有解析真的失败（文件被截断/格式不认识）才会落到个位数。
     if [ "$n2" -lt 10 ]; then
       err "两种方式都没取到足够目标（ninja -t targets=${n1}, 解析=${n2}）"
       err "请检查 $out/soong/build.ninja 是否正常（真实大小约 1GB）"
@@ -177,8 +190,11 @@ plan_print_phony_summary() {
   local ninja
   ninja="$(find_ninja)"
   log "顶层 phony 目标摘要（前 60 个）:"
-  "$ninja" -C "$out" -t targets 2>/dev/null \
+  local mf
+  mf="$(aosp_ninja_manifest)" || { warn "找不到 ninja 入口文件，跳过 phony 摘要"; return 0; }
+  "$ninja" -C "$out" -f "$mf" -t targets 2>/dev/null \
     | grep -E ': phony' | awk -F: '{print $1}' | LC_ALL=C sort -u | head -n 60 | sed 's/^/    /'
+  return 0
 }
 
 # 判断某个目标是否被 metalava 规则排除

@@ -85,10 +85,51 @@ while IFS= read -r f; do
   fi
 done < <(find . -type f -name '*.sh' -not -path './.git/*')
 if [ "$syn_found" -eq 0 ]; then
-  log "  OK：全部脚本语法正确"
-else
-  fail=1
-fi
+    log "  OK：全部脚本语法正确"
+  else
+    fail=1
+  fi
+
+  # ---------------------------------------------------------------------------
+  # 3b) ninja 调用必须显式带 -f
+  # ---------------------------------------------------------------------------
+  #  run 36991148496 的失败根因：AOSP 10 的 soong_ui 不生成 out/build.ninja，
+  #  它生成的是 out/combined<katiSuffix>.ninja。任何 `ninja -C "$out"` 而
+  #  不带 -f 的调用都会去找 out/build.ninja 并报
+  #      ninja: error: loading 'build.ninja': No such file or directory
+  #  然后整个 job 挂掉。这个检查让同类问题在 3 秒内暴露，而不是几小时后。
+  # ---------------------------------------------------------------------------
+  log "[3b/4] ninja 调用是否显式指定 -f 入口文件"
+  nf_found=0
+  while IFS= read -r f; do
+    # 跳过本文件自身：下面的匹配模式本身就长得像一条缺 -f 的命令
+    case "$f" in */selfcheck.sh) continue ;; esac
+    # 只看真正执行 ninja 的命令行（排除注释行）
+    while IFS= read -r ln; do
+      case "$ln" in
+        *'#'*) continue ;;
+      esac
+      # 命中 `ninja ... -C "$out"`（或 ${out}）但这一行没有 -f
+      case "$ln" in
+        *'-C "$out"'*|*'-C "${out}"'*|*'-C $out'*)
+          case "$ln" in
+            *' -f '*|*' -f"'*) : ;;
+            *)
+              err "  缺 -f: ${f#$REPO_ROOT/}: ${ln}"
+              err "        -> AOSP 10 的入口文件是 out/combined<katiSuffix>.ninja"
+              err "        -> 用 \$(require_ninja_manifest) 取，并把 -f \"\$mf\" 加到这条命令上"
+              nf_found=$(( nf_found + 1 ))
+              ;;
+          esac
+          ;;
+      esac
+    done < <(grep -n '' "$f" | sed 's/^[0-9]*://')
+  done < <(find . -type f -name '*.sh' -not -path './.git/*')
+  if [ "$nf_found" -eq 0 ]; then
+    log "  OK：所有 ninja 调用都显式带了 -f"
+  else
+    fail=1
+  fi
 
 # -----------------------------------------------------------------------------
 # 4) YAML 合法性

@@ -46,8 +46,16 @@ build_with_budget() {
 
   [ -f "$rsp" ] || { err "目标清单不存在: ${rsp}"; return "$BUDGET_EXIT_FAILED"; }
 
+  # ---- 入口文件：AOSP 10 是 combined<katiSuffix>.ninja ----
+  # 不带 -f 时 ninja 会去找 out/build.ninja（AOSP 10 不生成这个文件）并直接失败：
+  #   ninja: error: loading 'build.ninja': No such file or directory
+  # 这正是 run 36991148496 的失败原因。
+  local mf
+  mf="$(require_ninja_manifest)" || return "$BUDGET_EXIT_FAILED"
+
   banner "开始串行编译（预算 ${budget_min} 分钟，-j${AOSP_BUILD_JOBS}）"
-  log "ninja   : $ninja"
+  log "ninja     : $ninja"
+  log "入口文件  : $mf"
   log "目标清单: $rsp ($(count_lines "$rsp") 个目标)"
   log "预算    : ${budget_min} 分钟（到点优雅停止，工作量留给下一个 shard）"
   log "提示    : 进度可看本 job 日志，或 ninja 的 -d stats 输出"
@@ -57,7 +65,7 @@ build_with_budget() {
   local disk_stop_gb="${AOSP_DISK_STOP_GB:-5}"
 
   # 后台起 ninja，父进程轮询时间预算与磁盘余量
-  "$ninja" -C "$out" -j"$AOSP_BUILD_JOBS" -k "$AOSP_BUILD_KEEP_GOING" \
+  "$ninja" -C "$out" -f "$mf" -j"$AOSP_BUILD_JOBS" -k "$AOSP_BUILD_KEEP_GOING" \
            -d stats "@${rsp}" &
   pid=$!
   # 记下 pid，脚本退出时用它兜底收尾
@@ -174,10 +182,29 @@ is_build_complete() {
   [ -f "$out/soong/build.ninja" ] || { err "未找到 $out/soong/build.ninja"; return 2; }
   [ -f "$rsp" ] || { err "目标清单不存在: ${rsp}"; return 2; }
 
+  # 入口文件同 build_with_budget：AOSP 10 是 combined<katiSuffix>.ninja
+  local mf
+  mf="$(require_ninja_manifest)" || return 2
+
   local dry
   dry="$(mktemp -t ninja_dryrun.XXXXXX)"
   # -n 只列出"将要执行的命令"，不实际执行；返回码非 0 不影响"还有没有活"的判断
-  "$ninja" -C "$out" -n -j"$AOSP_BUILD_JOBS" "@${rsp}" > "$dry" 2>&1 || true
+  "$ninja" -C "$out" -f "$mf" -n -j"$AOSP_BUILD_JOBS" "@${rsp}" > "$dry" 2>&1 || true
+
+  # ---- 先排除「ninja 自己没跑起来」的情况，再谈完成判定 ----
+  # 危险方向：ninja 加载入口文件失败时，输出里只有
+  #     ninja: error: loading 'build.ninja': No such file or directory
+  # 而下面过滤 `^ninja:` 会把这一行也吃掉 -> real=0 -> 判定成「已全部编完」。
+  # 这是一个静默的假阳性：不完整的 out 会被当成完整产物传给 metalava / 打包阶段。
+  # 所以这里显式检查加载失败/未知目标/清单错误这类致命信息，直接返回 2（判定失败），
+  # 而不是让它掉进 real=0 的「已完成」分支。
+  if grep -qE "ninja: (error|fatal):" "$dry" 2>/dev/null; then
+    err "ninja dry-run 自身失败，无法判定构建是否完成："
+    head -n 10 "$dry" | sed 's/^/    /' >&2 || true
+    cp "$dry" "${CI_LOG_DIR}/ninja-dryrun-shard${AOSP_SHARD_INDEX:-1}.txt" 2>/dev/null || true
+    rm -f "$dry"
+    return 2
+  fi
 
   # ninja 自己说的话（no work to do / warning / error）不算"待执行命令"
   #
