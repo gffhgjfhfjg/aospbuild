@@ -91,42 +91,66 @@ if [ "$syn_found" -eq 0 ]; then
   fi
 
   # ---------------------------------------------------------------------------
-  # 3b) ninja 调用必须显式带 -f
+  # 3b) 校验 ninja 执行封装本身 + 拦截绕过封装的手写调用
   # ---------------------------------------------------------------------------
-  #  run 36991148496 的失败根因：AOSP 10 的 soong_ui 不生成 out/build.ninja，
-  #  它生成的是 out/combined<katiSuffix>.ninja。任何 `ninja -C "$out"` 而
-  #  不带 -f 的调用都会去找 out/build.ninja 并报
-  #      ninja: error: loading 'build.ninja': No such file or directory
-  #  然后整个 job 挂掉。这个检查让同类问题在 3 秒内暴露，而不是几小时后。
+  #  AOSP 10 有两个必须同时满足的条件，少一个都直接挂：
+  #    1) 显式 -f 指向 out/combined<katiSuffix>.ninja
+  #       （AOSP 10 不生成 out/build.ninja）          -> run 36991148496
+  #    2) CWD 必须是 $TOP，不能用 -C "$out"
+  #       （combined*.ninja 里是相对 subninja 路径）  -> run 37088938342
+  #  两者都由 common.sh 的 ninja_run / ninja_run_bg / ninja_xargs_pipe 保证。
+  #
+  #  3b-1 先校验封装本身没被改坏（这是真正的不变量所在）
+  #  3b-2 再扫一遍有没有绕过封装手写的 ninja 调用
+  #       判据：同一行里同时出现 ninja 可执行文件 **和 ninja 的行为开关**
+  #             （-f/-t/-n/-j/-k/-C/-d），才算一次真正的调用。
+  #       这样就不会误伤 find_ninja() 里的候选路径列表、错误提示字符串，
+  #       以及 --help / --version 这类不加载构建图的能力探测。
   # ---------------------------------------------------------------------------
-  log "[3b/4] ninja 调用是否显式指定 -f 入口文件"
+  log "[3b/4] ninja 执行封装校验 + 绕过封装检测"
+
   nf_found=0
+  for fn in ninja_run ninja_run_bg ninja_xargs_pipe; do
+    body="$(awk -v fn="$fn" '
+      $0 ~ "^"fn"\\(\\)" {inside=1}
+      inside {print}
+      inside && /^}/ {exit}
+    ' "${REPO_ROOT}/build_scripts/lib/common.sh")"
+    case "$body" in
+      *'cd "$AOSP_SRC_DIR"'*) : ;;
+      *) err "  ${fn}() 缺少 cd \"\$AOSP_SRC_DIR\"（AOSP 10 的 subninja 是相对路径）"; nf_found=$((nf_found+1)) ;;
+    esac
+    case "$body" in
+      *'-f "$mf"'*) : ;;
+      *) err "  ${fn}() 缺少 -f \"\$mf\"（入口是 combined<katiSuffix>.ninja，不是 build.ninja）"; nf_found=$((nf_found+1)) ;;
+    esac
+  done
+
   while IFS= read -r f; do
-    # 跳过本文件自身：下面的匹配模式本身就长得像一条缺 -f 的命令
-    case "$f" in */selfcheck.sh) continue ;; esac
-    # 只看真正执行 ninja 的命令行（排除注释行）
+    # common.sh 里就是封装本身，跳过
+    case "$f" in */common.sh|*/selfcheck.sh) continue ;; esac
     while IFS= read -r ln; do
       case "$ln" in
         *'#'*) continue ;;
+        *--help*|*--version*) continue ;;
+        *ninja_run*|*ninja_xargs_pipe*) continue ;;
       esac
-      # 命中 `ninja ... -C "$out"`（或 ${out}）但这一行没有 -f
+      # 必须同时有 ninja 可执行文件 + 行为开关
+      has_bin=0; has_flag=0
+      case "$ln" in *'"$ninja"'*) has_bin=1 ;; esac
       case "$ln" in
-        *'-C "$out"'*|*'-C "${out}"'*|*'-C $out'*)
-          case "$ln" in
-            *' -f '*|*' -f"'*) : ;;
-            *)
-              err "  缺 -f: ${f#$REPO_ROOT/}: ${ln}"
-              err "        -> AOSP 10 的入口文件是 out/combined<katiSuffix>.ninja"
-              err "        -> 用 \$(require_ninja_manifest) 取，并把 -f \"\$mf\" 加到这条命令上"
-              nf_found=$(( nf_found + 1 ))
-              ;;
-          esac
-          ;;
+        *' -f '*|*' -t '*|*' -n '*|*' -j'*|*' -k '*|*' -C '*|*' -d '*) has_flag=1 ;;
       esac
-    done < <(grep -n '' "$f" | sed 's/^[0-9]*://')
+      if [ "$has_bin" = 1 ] && [ "$has_flag" = 1 ]; then
+        err "  绕过封装: ${f#$REPO_ROOT/}: ${ln}"
+        err "        -> 必须走 ninja_run / ninja_run_bg / ninja_xargs_pipe"
+        err "        -> 手写会踩 run 36991148496(缺 -f) / run 37088938342(多 -C) 两个坑"
+        nf_found=$(( nf_found + 1 ))
+      fi
+    done < <(sed 's/^/&&/' "$f")
   done < <(find . -type f -name '*.sh' -not -path './.git/*')
   if [ "$nf_found" -eq 0 ]; then
-    log "  OK：所有 ninja 调用都显式带了 -f"
+    log "  OK：ninja 调用全部经由 ninja_run* 封装"
   else
     fail=1
   fi

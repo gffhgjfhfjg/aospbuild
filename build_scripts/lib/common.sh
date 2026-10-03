@@ -491,20 +491,38 @@ find_ninja() {
 #      out/combined<katiSuffix>.ninja      katiSuffix = "-<TARGET_PRODUCT>"
 #  即 aosp_arm64 产品下是 out/combined-aosp_arm64.ninja。
 #  该文件内容极短（见 build/soong/ui/build/build.go 的 combinedBuildNinjaTemplate）：
-#      builddir = <绝对路径>
+#      builddir = out
 #      build _kati_always_build_: phony
-#      subninja <out>/build-aosp_arm64.ninja          <- kati 主体
-#      subninja <out>/build-aosp_arm64-package.ninja  <- kati 打包
-#      subninja <out>/soong/build.ninja               <- soong 图（约 1GB）
+#      subninja out/build-aosp_arm64.ninja          <- kati 主体
+#      subninja out/build-aosp_arm64-package.ninja  <- kati 打包
+#      subninja out/soong/build.ninja               <- soong 图（约 1GB）
 #
-#  ninja 不带 -f 时默认读 ./build.ninja，于是：
+#  不带 -f 时 ninja 默认读 ./build.ninja，于是：
 #      ninja -C out ...
 #      ninja: Entering directory `.../out'
 #      ninja: error: loading 'build.ninja': No such file or directory
 #  直接 exit 1。注意 out/soong/build.ninja 是存在的（1GB+），
 #  所以「文件缺失」只可能是入口文件名不对，不是图没生成。
 #
-#  用法: mf="$(aosp_ninja_manifest)" || die ...   然后 ninja -C "$out" -f "$mf"
+# =============================================================================
+#  【为什么还必须去掉 -C，并且在 $TOP 下执行 —— run 37088938342 的失败根因】
+#  上面那些 subninja 路径是**相对路径**（`out/build-...`），ninja 按 **CWD** 解析。
+#  根因在 AOSP 10 的 build/soong/ui/build/config.go：
+#      outDir := "out"                       // 相对，不做绝对化
+#      ret.environ.Set("OUT_DIR", outDir)
+#  对比 AOSP 8/9（同一函数的旧版本）会把 outDir 绝对化：
+#      outDir = filepath.Join(os.Getenv("TOP"), outDir)
+#  AOSP 10 删掉了这一步，所以 combined*.ninja 里全是相对路径。
+#
+#  soong_ui 自己跑 ninja 时（ui/build/ninja.go 的 runNinja）只传 `-f`，**不传 `-C`**，
+#  即 ninja 的 CWD 就是 $TOP，相对路径才解析得对。
+#  我们如果写 `ninja -C "$out" -f "$mf"`，CWD 被切到 out/，就会去找
+#  out/out/build-aosp_arm64.ninja：
+#      ninja: error: .../combined-aosp_arm64.ninja:6:
+#        loading 'out/build-aosp_arm64.ninja': No such file or directory
+#
+#  结论：所有 ninja 调用一律走下面的 ninja_run / ninja_run_bg，
+#  它们负责「切到 $TOP + 显式 -f」，不要手写 ninja 命令行。
 # =============================================================================
 aosp_ninja_manifest() {
   local out; out="$(aosp_out)"
@@ -537,6 +555,43 @@ require_ninja_manifest() {
   err "out 下现有的 *.ninja 文件："
   ls -1 "$out"/*.ninja 2>/dev/null | sed 's/^/    /' >&2 || true
   return 1
+}
+
+# -----------------------------------------------------------------------------
+# ninja 执行的唯一入口（CWD=$TOP + 显式 -f），不要绕过它手写 ninja 命令行
+# -----------------------------------------------------------------------------
+# 用法:
+#   ninja_run    <ninja参数...>            前台执行
+#   ninja_run_bg <ninja参数...>            后台执行，ninja 的 PID 存到 $!
+#
+# 用 `exec` 是为了让子 shell 被 ninja 进程本身替换掉，
+# 这样后台启动时 `$!` 拿到的就是 ninja 的真实 PID —— build_with_budget 靠它发 SIGINT
+# 做优雅停止，如果拿到的是子 shell 的 PID，信号就不会传给 ninja。
+ninja_run() {
+  local mf ninja
+  mf="$(require_ninja_manifest)" || return 1
+  ninja="$(find_ninja)"
+  ( cd "$AOSP_SRC_DIR" && exec "$ninja" -f "$mf" "$@" )
+}
+
+ninja_run_bg() {
+  local mf ninja
+  mf="$(require_ninja_manifest)" || return 1
+  ninja="$(find_ninja)"
+  ( cd "$AOSP_SRC_DIR" && exec "$ninja" -f "$mf" "$@" ) &
+  COMPILE_SHARD_NINJA_PID=$!
+  return 0
+}
+
+# 供 xargs 批量模式使用：在管道里执行需要先把 CWD 切到 $TOP。
+# 用法: <产生目标清单的命令> | ninja_xargs_pipe <ninja参数...>
+# 注意 xargs 自身会再 fork 多次，所以这里不能用 exec（会丢掉 xargs 的命令行），
+# 但 xargs 是前台等待的，不存在 SIGINT 传递问题。
+ninja_xargs_pipe() {
+  local mf ninja
+  mf="$(require_ninja_manifest)" || return 1
+  ninja="$(find_ninja)"
+  ( cd "$AOSP_SRC_DIR" && xargs -r "$ninja" -f "$mf" "$@" )
 }
 
 # 目标是否在 Makefile 中真实存在（防止 m 报 Unknown target）

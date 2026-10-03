@@ -91,35 +91,44 @@ dist_images/*.img                          # 最终 ARM64 镜像
 最后用 `ninja @out/.stage1_targets.rsp` 精确构建保留目标（响应文件方式，避免命令行长度溢出）。
 清单落在 `out/.ninja_targets_*.txt`，失败时可直接复盘。
 
-**必须显式 `-f` 指定 ninja 入口文件**（AOSP 10 的坑，run 36991148496）
-AOSP 10 的 soong_ui **不生成** `out/build.ninja`，它生成的是
-`out/combined<katiSuffix>.ninja`（`katiSuffix = "-<TARGET_PRODUCT>"`，
-aosp_arm64 下即 `out/combined-aosp_arm64.ninja`）。该文件很短，只是三行 `subninja`：
+**必须显式 `-f` 且必须在 `$TOP` 下执行 ninja**（AOSP 10 的坑）
 
-```
-builddir = <out 绝对路径>
-build _kati_always_build_: phony
-subninja <out>/build-aosp_arm64.ninja           # kati 主体
-subninja <out>/build-aosp_arm64-package.ninja   # kati 打包
-subninja <out>/soong/build.ninja                # soong 图（约 1GB）
-```
+这是本项目踩过两次的坑，两个条件缺一不可：
 
-`ninja` 不带 `-f` 时默认读 `./build.ninja`，于是任何 `ninja -C "$out" ...`
-都会直接失败：
+1. **入口文件不是 `out/build.ninja`** —— AOSP 10 的 soong_ui 生成的是
+   `out/combined<katiSuffix>.ninja`（`katiSuffix = "-<TARGET_PRODUCT>"`，
+   aosp_arm64 下即 `out/combined-aosp_arm64.ninja`）。不带 `-f` 时 ninja 默认读
+   `./build.ninja`，直接失败（run 36991148496）：
+   ```
+   ninja: error: loading 'build.ninja': No such file or directory
+   ```
+   因为 `out/soong/build.ninja` 确实存在（1GB+），日志很容易被误导成
+   「soong 没生成构建图」。
 
-```
-ninja: Entering directory `.../out'
-ninja: error: loading 'build.ninja': No such file or directory
-```
+2. **不能用 `-C "$out"`** —— `combined*.ninja` 内部是**相对** subninja 路径
+   （`subninja out/build-aosp_arm64.ninja`），ninja 按 **CWD** 解析。
+   根源在 AOSP 10 的 `build/soong/ui/build/config.go` 把 `OUT_DIR` 保持成相对的
+   `"out"`（AOSP 8/9 会 `filepath.Join(os.Getenv("TOP"), outDir)` 转绝对，
+   AOSP 10 删掉了这步）。soong_ui 自己跑 ninja 时只传 `-f`、**不传 `-C`**。
+   所以加了 `-C "$out"` 之后 CWD 被切进 `out/`，就变成找 `out/out/...`（run 37088938342）：
+   ```
+   ninja: error: .../combined-aosp_arm64.ninja:6:
+     loading 'out/build-aosp_arm64.ninja': No such file or directory
+   ```
 
-因为 `out/soong/build.ninja` 确实存在（1GB+），日志里很容易误判成
-「soong 没生成构建图」，实际只是入口文件名不对。
-仓库里所有 ninja 调用都通过 `common.sh` 的 `require_ninja_manifest()`
-取入口文件并显式传 `-f`；`selfcheck.sh` 的 `[3b/4]` 项会拦截任何漏加 `-f` 的调用。
+因此仓库里**不允许手写 ninja 命令行**，一律走 `common.sh` 的封装：
+
+| 封装 | 用途 |
+|------|------|
+| `ninja_run`     | 前台执行：`cd $TOP && exec ninja -f <combined*.ninja> ...` |
+| `ninja_run_bg`  | 后台执行；用 `exec` 让 `$!` 拿到 ninja 真实 PID（预算控制靠它发 SIGINT） |
+| `ninja_xargs_pipe` | 管道里 xargs 分批执行（老 ninja 不支持 `@file` 时的回退路径） |
+
+`selfcheck.sh` 的 `[3b/4]` 项会校验这三个封装本身没被改坏，并拦截绕过封装的手写调用。
 
 >顺带纠正一个历史误判：AOSP 10 自带的 ninja 1.8.2 **是支持** `-t targets all` 的
 >（`src/ninja.cc` 的 `NinjaMain::ToolTargets` 里有 `mode == "all"` 分支）。
-> 之前「只拿到 0 个目标 => ninja 版本太老」的结论是错的，0 个的真正原因就是上面这个 `-f` 缺失。
+> 之前「只拿到 0 个目标 => ninja 版本太老」的结论是错的，0 个的真正原因就是上面第 1 条。
 
 排除正则除了 `metalava` / `update-api` / `check-api` / `api-versions` 这些显式目标，
 **还必须排除 metalava 的输出文件本身**（`*/api/current.txt`、`*/api/system-current.txt`、
@@ -583,9 +592,10 @@ aosp_arm64-eng = AOSP generic ARM64 参考产品 (AOSP reference / GSI 风格 ta
 | 现象 | 原因 | 处理 |
 |------|------|------|
 | `bad interpreter: No such file or directory` | python shebang 指向 `python` | `sync_source.sh --fix-python`（脚本已自动执行）；确认 `python-is-python3` 装上 |
-| `ninja: error: loading 'build.ninja': No such file or directory` | ninja 调用漏了 `-f`，AOSP 10 的入口文件是 `out/combined<katiSuffix>.ninja` 而非 `out/build.ninja` | 用 `$(require_ninja_manifest)` 取入口文件；`selfcheck.sh` 的 `[3b/4]` 项会提前拦截 |
+| `ninja: error: loading 'build.ninja': No such file or directory` | 漏了 `-f`，AOSP 10 的入口是 `out/combined<katiSuffix>.ninja` | 走 `ninja_run`，不要手写 ninja |
+| `ninja: error: .../combined-*.ninja:N: loading 'out/build-*.ninja': No such file` | 多了 `-C "$out"`，CWD 必须是 `$TOP` | 走 `ninja_run`，它会先 `cd $TOP` |
 | `ninja: error: unknown target` | 目标清单含 ninja 图里没有的目标 | 确认已执行 `m nothing`；脚本会自动切 `xargs` 分批模式 |
-| `ninja -t targets all` 返回 0 个目标 | 多半是上一条（缺 `-f`），ninja 加载失败后 stderr 被吞 | 看 `out/.ninja_targets_err.txt`；AOSP 10 自带的 ninja 1.8.2 **是支持** `-t targets all` 的 |
+| `ninja -t targets all` 返回 0 个目标 | 多半是上面两条之一，ninja 加载失败后 stderr 被吞 | 看 `out/.ninja_targets_err.txt`；ninja 1.8.2 **是支持** `-t targets all` 的 |
 | `ninja: ... Killed` / exit 137 | OOM | 确认 16G swap 生效（`swapon --show`）；调小 `JAVA_TOOL_OPTIONS` 的 `-Xmx` |
 | `patch: **** Only garbage was found in the patch input` | 补丁不是 `a/ b/` 前缀或格式错 | 用 `--howto` 重新生成 |
 | `m installclean` 报错后继续 | out 已是干净状态 | 脚本已降级为 warning，不阻塞 |

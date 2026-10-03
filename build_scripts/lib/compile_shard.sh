@@ -46,16 +46,16 @@ build_with_budget() {
 
   [ -f "$rsp" ] || { err "目标清单不存在: ${rsp}"; return "$BUDGET_EXIT_FAILED"; }
 
-  # ---- 入口文件：AOSP 10 是 combined<katiSuffix>.ninja ----
-  # 不带 -f 时 ninja 会去找 out/build.ninja（AOSP 10 不生成这个文件）并直接失败：
-  #   ninja: error: loading 'build.ninja': No such file or directory
-  # 这正是 run 36991148496 的失败原因。
+  # ---- 入口文件 + CWD：AOSP 10 必须从 $TOP 跑并显式 -f ----
+  # combined*.ninja 内部是相对 subninja 路径，ninja 按 CWD 解析；
+  # 用 -C "$out" 会让它去找 out/out/build-*.ninja（run 37088938342）。
   local mf
   mf="$(require_ninja_manifest)" || return "$BUDGET_EXIT_FAILED"
 
   banner "开始串行编译（预算 ${budget_min} 分钟，-j${AOSP_BUILD_JOBS}）"
   log "ninja     : $ninja"
   log "入口文件  : $mf"
+  log "工作目录  : ${AOSP_SRC_DIR}（$TOP，不可加 -C）"
   log "目标清单: $rsp ($(count_lines "$rsp") 个目标)"
   log "预算    : ${budget_min} 分钟（到点优雅停止，工作量留给下一个 shard）"
   log "提示    : 进度可看本 job 日志，或 ninja 的 -d stats 输出"
@@ -64,12 +64,12 @@ build_with_budget() {
   local pid rc=0 budget_hit=0 disk_hit=0
   local disk_stop_gb="${AOSP_DISK_STOP_GB:-5}"
 
-  # 后台起 ninja，父进程轮询时间预算与磁盘余量
-  "$ninja" -C "$out" -f "$mf" -j"$AOSP_BUILD_JOBS" -k "$AOSP_BUILD_KEEP_GOING" \
-           -d stats "@${rsp}" &
-  pid=$!
-  # 记下 pid，脚本退出时用它兜底收尾
-  COMPILE_SHARD_NINJA_PID="$pid"
+  # 后台起 ninja，父进程轮询时间预算与磁盘余量。
+  # ninja_run_bg 内部用 exec 切到 $TOP 并 exec ninja，所以 $! 就是 ninja 的 PID。
+  ninja_run_bg -j"$AOSP_BUILD_JOBS" -k "$AOSP_BUILD_KEEP_GOING" \
+                -d stats "@${rsp}" \
+    || { err "ninja 启动失败（入口文件/工作目录异常）"; return "$BUDGET_EXIT_FAILED"; }
+  pid="$COMPILE_SHARD_NINJA_PID"
 
   local elapsed last_report
   last_report=$t0
@@ -189,7 +189,8 @@ is_build_complete() {
   local dry
   dry="$(mktemp -t ninja_dryrun.XXXXXX)"
   # -n 只列出"将要执行的命令"，不实际执行；返回码非 0 不影响"还有没有活"的判断
-  "$ninja" -C "$out" -f "$mf" -n -j"$AOSP_BUILD_JOBS" "@${rsp}" > "$dry" 2>&1 || true
+  # 必须走 ninja_run（CWD=$TOP + -f 入口文件），理由见 common.sh 的说明
+  ninja_run -n -j"$AOSP_BUILD_JOBS" "@${rsp}" > "$dry" 2>&1 || true
 
   # ---- 先排除「ninja 自己没跑起来」的情况，再谈完成判定 ----
   # 危险方向：ninja 加载入口文件失败时，输出里只有

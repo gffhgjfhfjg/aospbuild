@@ -92,9 +92,9 @@ ninja_list_all_targets() {
 
   local f="$out/.ninja_targets_all.txt"
 
-  # ---- 路径 1：ninja -t targets all（正确入口文件下可用）----
+  # ---- 路径 1：ninja -t targets all（正确入口文件 + 正确 CWD 下可用）----
   : > "$f"
-  "$ninja" -C "$out" -f "$mf" -t targets all 2>"$out/.ninja_targets_err.txt" \
+  ninja_run -t targets all 2>"$out/.ninja_targets_err.txt" \
     | awk -F: 'NF>1{print $1}' >> "$f" || true
   local n1; n1="$(count_lines "$f")"
 
@@ -190,9 +190,7 @@ plan_print_phony_summary() {
   local ninja
   ninja="$(find_ninja)"
   log "顶层 phony 目标摘要（前 60 个）:"
-  local mf
-  mf="$(aosp_ninja_manifest)" || { warn "找不到 ninja 入口文件，跳过 phony 摘要"; return 0; }
-  "$ninja" -C "$out" -f "$mf" -t targets 2>/dev/null \
+  ninja_run -t targets 2>/dev/null \
     | grep -E ': phony' | awk -F: '{print $1}' | LC_ALL=C sort -u | head -n 60 | sed 's/^/    /'
   return 0
 }
