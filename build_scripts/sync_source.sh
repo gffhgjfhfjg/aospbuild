@@ -5,7 +5,7 @@
 #  子命令（可组合，按此顺序执行）：
 #    --init              repo init（浅克隆 + 指定 tag）
 #    --sync              repo sync（--retry-fetches=3 抗网络抖动）
-#    --fix-python        修复 python shebang
+#    --fix-python        python 解释器适配（shebang 按语法路由 + py2/py3 语义错位修复）
 #    --prune-device-trees 删除 crosshatch / bonito 设备树
 #    --apply-patches     批量 apply CI 仓库 patches/
 #    --prune-source      裁剪与 arm64 参考镜像无关的源码（省磁盘，可选）

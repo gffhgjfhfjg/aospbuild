@@ -75,8 +75,8 @@ dist_images/*.img                          # 最终 ARM64 镜像
 
 | Job | 名称 | 职责 | timeout |
 |-----|------|------|---------|
-| 1 | `sync_source` | 装宿主依赖 + ARM64 交叉工具链；`repo sync --retry-fetches=3`；python shebang 修复；删除 crosshatch/bonito 设备树；批量 apply 补丁；缓存 `.repo` | 300 min |
-| 2 | `build_stage1` | 16G swap；`lunch aosp_arm64-eng`；`m nothing` 生成构建图；**-j1 串行编译「排除 metalava 之外全部 ninja 目标」**；分片打包 `out` 上传 | 300 min |
+| 1 | `sync_source` | 装宿主依赖（含 **python2.7**）+ ARM64 交叉工具链；`repo sync --retry-fetches=3`；python 解释器适配；删除 crosshatch/bonito 设备树；批量 apply 补丁；缓存 `.repo` | 300 min |
+| 2 | `build_stage1` | 16G swap；`lunch aosp_arm64-eng`；`m nothing` 生成构建图；**-j1 串行编译「产品交付物（`*.img`）及其依赖闭包」**（默认 product 范围，见下文）；分片打包 `out` 上传 | 300 min |
 | 3 | `build_stage2` | 下载 stage1 的 `out`；**串行单独执行全部 metalava 任务**（`metalava` / `metalava-full` / `metalava-sdk` / `update-api`）；重新打包上传 | 300 min |
 | 4 | `build_stage3` | 下载 metalava 阶段 `out`；`m installclean` + **镜像打包**；导出 `system.img` / `vendor.img` / `odm.img` 等；上传最终镜像 | 300 min |
 
@@ -138,12 +138,52 @@ dist_images/*.img                          # 最终 ARM64 镜像
 若本机 ninja 不支持 `@file` 响应文件（AOSP 10 自带的 1.8.2 就是如此），
 脚本会自动切到 `xargs` 分批回退模式，无需手工设 `AOSP_NINJA_TARGETS_MODE`。
 
-**python shebang 修复**（`build_scripts/lib/fix_python_shebang.sh`）
-系统层装 `python-is-python3` 并建 `python -> python3` 软链；源码层把
-`#!/usr/bin/env python` / `#!/usr/bin/python` / `#!/usr/bin/env python2[.7]`
-统一改写成 `python3`（只改第 1 行，源码零改动，改写用 `cat tmp > f` 保留可执行位）。
-默认 `AOSP_SHEBANG_SKIP_EXISTING=1`（本机若已有该解释器就跳过，适合本地开发机）；
-CI 上建议设成 `0`，保证结果确定可复现 —— GitHub runner 上本来就没有 `python`/`python2`。
+**目标范围：默认 product，不要用 all**（run 37093496242 的教训）
+
+`build.ninja` 里躺着**所有模块的所有变体**（host/device/vendor/common/product/sdk/cts，
+连 32 位 arm core、Robolectric、CTS test-config 都在内），实测 **82774** 个目标。
+其中绝大多数 `aosp_arm64` 这个产品**根本不会构建**（Google 自己也从不构建），
+而这些目标里有一批是**编译不过**的，一旦构建到它们，ninja 就判定整个 build failed：
+
+| 只在「全量目标」路径上出现的失败 | 症状 |
+|---|---|
+| `hardware.google.media.c2@1.0-service` 的 32 位 vendor 变体 | `types.h: fatal error: 'gui/IGraphicBufferProducer.h' file not found`（vendor 变体拿不到 gui 的 include 路径） |
+| `bionic/libc` 的 `android_arm_armv8-a_core` 系列 | 32 位 core 变体的 seccomp / syscall 表 |
+| `host Java source list: Robolectric_*` | 由 `normalize_path.py`（py2 脚本）生成 |
+
+所以默认 `AOSP_STAGE1_TARGET_SCOPE=product`：只把**产品交付物**
+（`system.img` / `vendor.img` / `odm.img` / `product.img` / `userdata.img` /
+`ramdisk.img` / `vbmeta.img`）写进 rsp，**ninja 自己会展开完整依赖闭包**——
+等价于 `m system.img vendor.img ...`，但完全不碰 metalava。
+目标名可用 `AOSP_PRODUCT_TARGETS` 覆盖；图里不存在的目标会被跳过并告警
+（`system.img` / `vendor.img` 一个都不命中则直接失败，防止「空跑却成功」）。
+需要复现旧行为时设 `AOSP_STAGE1_TARGET_SCOPE=all`。
+
+**python 解释器适配**（`build_scripts/lib/fix_python_shebang.sh`）
+
+AOSP 10 的官方宿主是 Ubuntu 18.04，**同时带 python2.7 与 python3**；
+22.04 默认只有 python3，而 AOSP 10 的构建脚本是 py2/py3 混编。
+把 shebang 一律改写成 python3 会同时踩两个坑（run 37093496242 实测 935 个目标失败）：
+
+| 类别 | 例子 | 症状 |
+|---|---|---|
+| py2-only 语法 | `merge-event-log-tags.py`、`build/tools/java-event-log-tags.py`、`bionic/libc/fs_config_generator.py`、`check_radio_versions.py`、`normalize_path.py`、`clang-version-inc.py` | `SyntaxError: Missing parentheses in call to 'print'` |
+| py2 语义、py3 语法合法 | `build/soong/scripts/manifest_fixer.py` 的 `write_xml()` | `TypeError: a bytes-like object is required, not 'str'`（一次编译命中 **896** 个目标） |
+| 显式找 python2.7 | bionic 的 `genfunctosyscallnrs` | `AssertionError: Could not find python binary: python2.7` |
+
+对应三步处理：
+
+1. **系统层**：`apt_deps.sh` 装 `python2`（jammy/universe 有 2.7.18-13ubuntu1.5）+
+   `python-is-python3`；`ensure_python2` 找不到解释器就直接失败，不留到编译期才炸。
+2. **shebang 路由**：逐文件做语法探测（`compile()`，不写 `__pycache__`），
+   python3 能编译就写 `python3`；只有 python3 编译不过而 python2.7 能编译才写
+   `python2.7`。改写仍然只动第 1 行，且用 `cat tmp > f` 保留可执行位。
+   `AOSP_SHEBANG_SKIP_EXISTING=1`（默认）在本机已有解释器时跳过，适合本地开发机；
+   CI 设 `0` 保证可复现。`AOSP_SHEBANG_PY2=0` 可禁用 python2 路由（会编译失败，别用）。
+3. **语义错位脚本**：`manifest.py` / `manifest_fixer.py` 的 `write_xml()` 就地改成
+   py2/py3 通用写法（先按文本拼好再按句柄类型编码），带 `[aosp-ci]` 标记且幂等。
+   注入的注释一律用 ASCII —— 这两个文件可能被 python2 脚本 import，
+   非 ASCII 且无 coding 声明会让 py2 直接 SyntaxError。
 
 **out 目录不进 cache**（硬性约束）
 只对 `.repo` 使用 `actions/cache`。`out` 通过 `actions/upload-artifact` 传递。

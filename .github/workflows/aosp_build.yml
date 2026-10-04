@@ -5,7 +5,7 @@
 #  宿主平台 : GitHub 托管 ubuntu-latest  (x86_64 机器，交叉编译 ARM64 固件)
 #  分段策略 : 4 个严格串行 job，每个 job timeout-minutes = 300 (5h)
 #             Job1 sync_source  -> 拉源码 / 装交叉工具链 / 修 shebang / 删设备树 / 缓存 .repo
-#             Job2 build_stage1 -> 16G swap / lunch / -j1 编译「除 metalava 外全部 ninja 目标」
+#             Job2 build_stage1 -> 16G swap / lunch / -j1 编译「产品交付物（*.img）及其依赖闭包」
 #             Job3 build_stage2 -> 串行单独执行 metalava + update-api
 #             Job4 build_stage3 -> 镜像打包，导出 ARM64 *.img
 #  失败处理 : 任意 job 失败时 always() 上传 ci_logs/ + out 下 *.log 作为 artifact
@@ -70,6 +70,21 @@ permissions:
 #    2) gcc 13 对 AOSP 10 的 host 模块 (-Werror) 会报出一批新告警直接失败
 #    3) AOSP 10 要求 JDK 11，24.04 默认 JDK 17
 #
+#  【硬性要求】22.04 上必须同时有 python3 和 python2.7。
+#  AOSP 10 的官方宿主是 Ubuntu 18.04（自带 python2），而 22.04 默认只有 python3。
+#  AOSP 10 的构建脚本是 py2/py3 混编，只留 python3 会导致（run 37093496242 实测 935 目标失败）：
+#    * py2-only 语法脚本 SyntaxError：build/make/tools/merge-event-log-tags.py、
+#      build/tools/java-event-log-tags.py、bionic/libc/fs_config_generator.py、
+#      build/make/tools/check_radio_versions.py、build/make/tools/normalize_path.py、
+#      external/clang/clang-version-inc.py
+#    * bionic 的 genfunctosyscallnrs 找不到 python2.7 -> AssertionError
+#    * build/soong 的 manifest_fixer.py 里write_xml() 在 py3 下把 str 写进 'wb'
+#      -> TypeError: a bytes-like object is required, not 'str'
+#      （soong 给每个带 AndroidManifest.xml 的模块都跑一次，单次编译命中 896 个目标）
+#  处理位置：lib/apt_deps.sh（apt 装 python2）+ lib/fix_python_shebang.sh
+#            （逐文件语法探测，把 py2-only 脚本的 shebang 指向 python2.7，
+#              并就地修 manifest_fixer 的 write_xml）
+#
 #  而且 GitHub 官方公告：ubuntu-latest 将在 2026-10-19 迁移到 Ubuntu 26。
 #  所以这里用 vars.AOSP_RUNNER_OS（仓库级 Variable，可不改代码切换），
 #  默认硬编码到 ubuntu-22.04，不随 latest 漂移。
@@ -112,6 +127,17 @@ env:
   AOSP_LMBGEN: '0'                      # 关闭 BuildImage lz4 压缩，加快打包
   AOSP_SKIP_METALAVA: '1'               # Job2 已在单独阶段执行，Job1 一律排除
   AOSP_METALAVA_TARGETS: 'metalava metalava-full metalava-sdk update-api'
+
+  # --- Job2 编译目标范围 ---
+  #  product = 只把产品交付物（*.img）交给 ninja，由 ninja 展开完整依赖闭包。
+  #            等价于 `m system.img vendor.img ...`，但完全不碰 metalava。
+  #  all     = 构建 ninja 图里的全部目标（实测 82774 个）。**不要用**：
+  #            其中绝大多数是 aosp_arm64 根本不构建的模块变体（32 位 arm core、
+  #            Robolectric、CTS test-config 等），踩到它们的失败（典型：
+  #            hardware.google.media.c2@1.0-service 的 32 位 vendor 变体报
+  #            'gui/IGraphicBufferProducer.h' file not found）会让整个 job 失败。
+  AOSP_STAGE1_TARGET_SCOPE: 'product'
+  AOSP_PRODUCT_TARGETS: 'system.img vendor.img odm.img product.img userdata.img ramdisk.img vbmeta.img'
 
   # --- Job4 镜像打包目标 ---
   AOSP_STAGE3_IMAGE_TARGETS: 'systemimg vendorimg odmimg productimg ramdisk userdataimg vbmetaimg'
@@ -167,9 +193,13 @@ env:
   PATCH_APPLY_ENABLED: '1'
 
   # --- shebang 修复策略 ---
-  # 0 = 一律把 python/python2 shebang 改写成 python3（CI 推荐，结果确定可复现）
-  # 1 = 本机若已存在该解释器就跳过（本地开发机推荐，保留 python2 老脚本）
+  #  0 = 一律改写 shebang（CI 推荐，结果确定可复现）。目标解释器**按语法探测**决定：
+  #      python3 能编译 -> python3；python3 编译不过而 python2.7 能编译 -> python2.7。
+  #      （AOSP 10 不是「全量 python3 化」，py2-only 脚本必须留给 python2.7）
+  #  1 = 本机若已存在该解释器就跳过（本地开发机推荐，保留 python2 老脚本）
   AOSP_SHEBANG_SKIP_EXISTING: '0'
+  #  是否允许把脚本路由到 python2.7：auto(默认，允许) | 0（只写 python3，会编译失败）
+  AOSP_SHEBANG_PY2: 'auto'
 
   # --- 日志 ---
   CI_LOG_DIR: ${{ github.workspace }}/ci_logs
@@ -294,11 +324,12 @@ jobs:
 
   # ===========================================================================
   # Job 2 / 5 —— build_stage1a （编译 shard 1/N）
-  #   职责：16G swap、lunch aosp_arm64-eng、-j1 编译「除 metalava 外全部 ninja 目标」
+  #   职责：16G swap、lunch aosp_arm64-eng、-j1 编译「产品交付物（*.img）及其依赖闭包」
   #         跑到时间预算就优雅停止 -> 打包 out -> artifact
   #
   #   【为什么拆成多个编译 job】
   #   -j1 编译 aosp_arm64-eng 全量目标实测需要 5~8 小时，而单 job 硬上限 300 分钟。
+  #     （改成 product 范围后目标数会明显下降，实际耗时以日志里的 [n/total] 为准）
   #   拆成 N 个 shard：AOSP_COMPILE_SHARDS 控制个数，N 个 job 串行。
   #
   #   【分片原理：不按目标名切分，按时间预算 + 增量续跑】
@@ -370,7 +401,7 @@ jobs:
           set -euo pipefail
           ./build_scripts/prepare_runner.sh --swap-only
 
-      - name: '编译 shard 1（-j1，排除 metalava，时间预算内增量编译）'
+      - name: '编译 shard 1（-j1，产品交付物 + 依赖闭包，时间预算内增量编译）'
         run: |
           set -euo pipefail
           ./build_scripts/stage1_build.sh

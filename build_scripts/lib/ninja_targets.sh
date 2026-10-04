@@ -134,6 +134,114 @@ ninja_list_all_targets() {
   fi
 }
 
+# =============================================================================
+#  目标范围：product（默认） vs all
+# -----------------------------------------------------------------------------
+#  【为什么不默认用「全部 ninja 目标」】—— run 37093496242 的教训
+#
+#  soong+kati 生成的 build.ninja 里躺着 **所有模块的所有变体**：
+#  host / device / vendor / common / product / sdk / cts ...，
+#  连 32 位 arm（android_arm_armv8-a_core）和 Robolectric、CTS 用到的
+#  各种 test-config 都在里面，实测 82774 个目标。
+#
+#  绝大多数目标 aosp_arm64 这个产品**根本不会构建**（Google 自己也从不构建它们），
+#  于是「全量目标」模式会额外踩到一长串只在这条路径上出现的失败，例如：
+#    * hardware.google.media.c2@1.0-service 的 32 位 vendor 变体：
+#      vendor 变体拿不到 gui 的 include 路径，clang 直接报
+#      'gui/IGraphicBufferProducer.h' file not found
+#    * bionic/libc 的 android_arm_armv8-a_core（32 位 core 变体）系列
+#    * host Java source list: Robolectric_*
+# 这些失败与我们要的 arm64 镜像毫无关系，却会让 ninja 判定 build failed，
+# 让整个 job 失败，还白白烧掉几小时机时。
+#
+#  【product 模式】
+#  只把「产品交付物」（system.img / vendor.img / ...）写进 ninja 的目标清单，
+#  ninja 自己会展开完整依赖闭包 —— 也就是等价于 `m system.img vendor.img ...`，
+#  但不牵扯 metalava。这才是「构建这个产品真正需要的东西」。
+#  依赖顺序、增量续跑、dry-run 判定等逻辑完全不变（都由 ninja 保证）。
+# =============================================================================
+AOSP_STAGE1_TARGET_SCOPE_DEFAULT="product"
+AOSP_PRODUCT_TARGETS_DEFAULT="system.img vendor.img odm.img product.img userdata.img ramdisk.img vbmeta.img"
+
+# 规划 product 范围的目标清单。返回 0 成功，1 =无法规划（调用方应 die）
+_plan_targets_product() {
+  local all="$1"
+  local out="$2"
+  local want="${AOSP_PRODUCT_TARGETS:-$AOSP_PRODUCT_TARGETS_DEFAULT}"
+
+  banner "规划 Ninja 目标（product 范围）"
+
+  # 图里可能同时存在 `system.img` 与 `out/target/product/<dev>/system.img` 两种写法，
+  # 所以额外建一份「basename 索引」，两种写法都能命中。
+  local base_idx="$out/.ninja_targets_base.txt"
+  awk -F: 'NF>1{n=$1; sub(/.*\//,"",n); print n}' "$all" | LC_ALL=C sort -u > "$base_idx"
+
+  local keep="$out/.ninja_targets_keep.txt"
+  local excl="$out/.ninja_targets_exclude.txt"
+  : > "$keep"
+  : > "$excl"
+
+  local t hit=0 miss=0
+  local dropped=""
+  for t in $want; do
+    if grep -Fxq -- "$t" "$all" 2>/dev/null || grep -Fxq -- "$t" "$base_idx" 2>/dev/null; then
+      printf '%s\n' "$t" >> "$keep"
+      hit=$((hit+1))
+    else
+      miss=$((miss+1))
+      dropped="${dropped}${dropped:+, }${t}"
+    fi
+  done
+  LC_ALL=C sort -u "$keep" -o "$keep"
+
+  log "请求的产品交付物: ${want}"
+  log "命中 ninja 图: ${hit} 个，图中不存在而丢弃: ${miss} 个${dropped:+（${dropped}）}"
+
+  # 硬校验：至少要有 system.img 或 vendor.img，否则说明 lunch/建图环节出了问题，
+  # 这时如果继续跑，ninja 会拿一个空目标清单去跑，等于什么都没构建却「成功」了。
+  if ! grep -Fxq -- "system.img" "$keep" 2>/dev/null \
+     && ! grep -Fxq -- "vendor.img" "$keep" 2>/dev/null; then
+    err "product 范围一个镜像目标都没命中 —— 请检查 lunch 是否成功、out/soong/build.ninja 是否正常"
+    err "  ninja 图里的镜像类目标（抽样）:"
+    grep -E '\.img$' "$base_idx" 2>/dev/null | head -n 15 | sed 's@^@      - @' >&2 || true
+    err "  可用 AOSP_PRODUCT_TARGETS 指定其它目标名后重跑"
+    return 1
+  fi
+
+  # 安全网：产品交付物里不该出现 metalava 相关目标，出现就剔掉（防止分段失效）。
+  # 先把候选拷到临时文件再回写，避免在 while 里改动正在被重定向读取的文件。
+  local cand="$out/.ninja_targets_cand.txt"
+  LC_ALL=C sort -u "$keep" > "$cand"
+  : > "$keep"
+  local metalava_hit=""
+  while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    if printf '%s\n' "$t" | grep -qE "$METALAVA_EXCLUDE_RE"; then
+      metalava_hit="${metalava_hit}${metalava_hit:+, }${t}"
+      printf '%s\n' "$t" >> "$excl"
+    else
+      printf '%s\n' "$t" >> "$keep"
+    fi
+  done < "$cand"
+  [ -n "$metalava_hit" ] && warn "剔除了 metalava 相关交付物: ${metalava_hit}"
+
+  {
+    echo "# ninja target plan"
+    echo "generated_at_utc=$(date -u +%FT%TZ)"
+    echo "aosp_tag=${AOSP_TAG}"
+    echo "scope=product"
+    echo "graph_total_targets=$(count_lines "$all")"
+    echo "keep_count=$(count_lines "$keep")"
+    echo "requested=${want}"
+  } > "$out/.ninja_targets_plan.txt"
+
+  log "product 范围目标清单（$(count_lines "$keep") 个）:"
+  sed 's@^@    - @' "$keep"
+  log "对比：若用 all 范围需要构建 $(count_lines "$all") 个目标"
+  log "目标规划完成（product 范围）"
+  return 0
+}
+
 # 分类目标：写入 $out/.ninja_targets_{exclude,keep}.txt
 plan_targets_excluding_metalava() {
   local out
@@ -141,7 +249,17 @@ plan_targets_excluding_metalava() {
   local all="$out/.ninja_targets_all.txt"
   [ -f "$all" ] || ninja_list_all_targets
 
-  banner "规划 Ninja 目标（排除 metalava）"
+  local scope="${AOSP_STAGE1_TARGET_SCOPE:-$AOSP_STAGE1_TARGET_SCOPE_DEFAULT}"
+  if [ "$scope" = "product" ]; then
+    _plan_targets_product "$all" "$out" || die "product 范围目标规划失败"
+    return 0
+  fi
+  [ "$scope" = "all" ] || die "AOSP_STAGE1_TARGET_SCOPE 只能是 product 或 all（当前 '${scope}'）"
+
+  banner "规划 Ninja 目标（all 范围，排除 metalava）"
+  warn "all 范围会构建 $(count_lines "$all") 个目标，其中大量是 aosp_arm64 永不构建的"
+  warn "模块变体（32 位 arm / Robolectric / CTS 等），踩到它们的失败会直接让 job 失败。"
+  warn "如无特殊需求请改用 AOSP_STAGE1_TARGET_SCOPE=product"
 
   # ---- 1) 命中的 metalava 目标 ----
   grep -E "$METALAVA_EXCLUDE_RE" "$all" > "$out/.ninja_targets_exclude.txt" || true
@@ -175,6 +293,7 @@ plan_targets_excluding_metalava() {
     echo "# ninja target plan"
     echo "generated_at_utc=$(date -u +%FT%TZ)"
     echo "aosp_tag=${AOSP_TAG}"
+    echo "scope=all"
     echo "exclude_count=${n_ex}"
     echo "keep_count=${n_keep}"
     echo "exclude_re=${METALAVA_EXCLUDE_RE}"

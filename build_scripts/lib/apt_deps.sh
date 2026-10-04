@@ -10,6 +10,19 @@
 #      因此这里不需要额外从 apt 装 aarch64-linux-gnu-gcc（装了也没用，soong 不用）
 #    * python-is-python3：AOSP10 大量脚本 shebang 是 `#!/usr/bin/env python`
 #      Ubuntu 22.04 已移除 python2 别名，不处理会直接 "No such file or directory"
+#    * python2：这条是硬性要求，不是可选兼容。
+#      AOSP 10 (Q) 官方宿主是 Ubuntu 18.04，**同时**带 python2.7 与 python3；
+#      到 Ubuntu 22.04 只剩 python3，于是「语法上能过 py3 编译、运行时却是 py2 语义」
+#      和「压根是 py2 语法」的两类脚本会一起暴毙（run 37093496242 实测 935 个目标失败）：
+#        build/make/tools/merge-event-log-tags.py   except X, e      -> SyntaxError
+#        build/tools/java-event-log-tags.py        except X, e      -> SyntaxError
+#        bionic/libc/fs_config_generator.py         print x          -> SyntaxError
+#        build/make/tools/check_radio_versions.py   print x          -> SyntaxError
+#        build/make/tools/normalize_path.py         print x          -> SyntaxError
+#        external/clang/clang-version-inc.py       print x          -> SyntaxError
+#        bionic 的 genfunctosyscallnrs 直接 AssertionError: Could not find python binary: python2.7
+#      22.04 的 jammy/universe 里 python2.7 (2.7.18-13ubuntu1.5) 仍在源里，
+#      apt 装得上（universe 在 GitHub runner 上默认已启用）。
 # =============================================================================
 
 # ---------- 分组包清单 ----------
@@ -73,6 +86,8 @@ APT_PKGS_COMPAT=(
   python3-dev
   python3-distutils        # 22.04 的 python3.10 里 distutils 仍可用但已弃用，显式装上更稳
   python-is-python3        # 关键：提供 /usr/bin/python -> python3
+  python2                  # 关键：提供 /usr/bin/python2.7。AOSP 10 的 py2-only 构建脚本靠它
+  python2-dev              # 少数 py2 脚本要 distutils 头文件
   libtinfo5                # lib32ncurses5 依赖 libtinfo5
   m4
   gperf
@@ -149,6 +164,9 @@ install_apt_deps() {
   # ---- python2 -> python3 兼容（Ubuntu 22.04 必做）----
   ensure_python3_alias
 
+  # ---- python2.7 存在性确认（AOSP 10 py2-only 脚本的硬性依赖）----
+  ensure_python2
+
   # ---- JDK 11（AOSP 10 硬要求）----
   #    Ubuntu 24.04 的默认 JDK 是 17，22.04 是 11；这里不依赖默认值，
   #    显式把 JAVA_HOME 指向 JDK 11，并在 AOSP 源码就位后用 prebuilts/jdk 兜底。
@@ -193,6 +211,44 @@ ensure_python3_alias() {
   [ "$(id -u)" -ne 0 ] && SUDO="sudo"
   $SUDO ln -sf "$(command -v python3)" /usr/local/bin/python
   log "已创建 /usr/local/bin/python -> $(command -v python3)"
+}
+
+# ---------------------------------------------------------------------------
+# python2.7 解析：返回可用的 py2 解释器，解析不出来则die
+# ---------------------------------------------------------------------------
+#  AOSP 10 的构建脚本是「py2 + py3 混编」：
+#    * 一部分是 py2-only语法（print 语句 / except X, e），py3 直接 SyntaxError
+#    * 一部分是 py2 语义但语法合法（manifest_fixer 的 write_xml），py3 编译过、运行时炸
+#  前者靠 fix_python_shebang.sh 路由到 python2.7，后者靠就地打补丁。
+#  另外 bionic 的 genfunctosyscallnrs 会自己去 PATH 里找 python2.7，
+#  所以 python2.7 必须在 PATH 里，而不是藏在某个目录中。
+resolve_python2() {
+  local c
+  for c in "${AOSP_PY2_BIN:-}" python2.7 python2 /usr/bin/python2.7; do
+    [ -n "$c" ] || continue
+    if command -v "$c" >/dev/null 2>&1; then
+      command -v "$c"
+      return 0
+    fi
+  done
+  return 1
+}
+
+ensure_python2() {
+  local py2
+  if py2="$(resolve_python2)"; then
+    log "python2.7 = ${py2} ($("$py2" -V 2>&1))"
+    # bionic 的 genfunctosyscallnrs 会直接按名字 exec python2.7，必须能按名解析
+    case ":$PATH:" in
+      *":$(dirname -- "$py2"):"*) : ;;
+      *) warn "python2.7 不在 PATH 里（当前 ${py2}）；若 genfunctosyscallnrs 报 Could not find python binary: python2.7 请检查 PATH" ;;
+    esac
+  else
+    err "找不到 python2.7 —— AOSP 10 有 py2-only 构建脚本，缺它必然编译失败"
+    err "  22.04 应可直接 apt 装：sudo apt-get install -y python2"
+    err "  若 apt 源里没有 python2，请检查 universe 是否启用（jammy/universe 有 2.7.18-13ubuntu1.5）"
+    exit 1
+  fi
 }
 
 # C.UTF-8 locale（部分 prebuilt 需要）

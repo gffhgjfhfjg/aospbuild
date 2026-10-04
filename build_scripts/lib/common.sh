@@ -38,6 +38,10 @@ fi
 : "${AOSP_SKIP_METALAVA:=1}"
 : "${AOSP_METALAVA_TARGETS:=metalava metalava-full metalava-sdk update-api}"
 : "${AOSP_STAGE3_IMAGE_TARGETS:=systemimg vendorimg odmimg productimg ramdisk userdataimg vbmetaimg}"
+# stage1 编译目标范围：product = 只请求产品交付物（*.img），ninja 自动展开依赖闭包；
+#all = 图里所有目标（82774 个，含 aosp_arm64 永不构建的模块变体，必踩坑）
+: "${AOSP_STAGE1_TARGET_SCOPE:=product}"
+: "${AOSP_PRODUCT_TARGETS:=system.img vendor.img odm.img product.img userdata.img ramdisk.img vbmeta.img}"
 : "${AOSP_SWAP_SIZE_GB:=16}"           # 硬性约束：16G swap
 : "${AOSP_SWAP_FILE:=/home/runner/aosp.swap}"
 : "${AOSP_SWAP_MODE:=auto}"

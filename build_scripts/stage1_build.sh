@@ -293,6 +293,9 @@ main() {
     echo "build_number=${BUILD_NUMBER}"
     echo "build_jobs=${AOSP_BUILD_JOBS}"
     echo "skip_metalava=${AOSP_SKIP_METALAVA}"
+    echo "target_scope=${AOSP_STAGE1_TARGET_SCOPE:-product}"
+    echo "product_targets=${AOSP_PRODUCT_TARGETS:-}"
+    echo "ninja_target_count=$(count_lines "$(aosp_out)/.stage1_targets.rsp" 2>/dev/null || echo '?')"
     echo "finished_at_utc=$(date -u +%FT%TZ)"
     echo "--- excluded (metalava) targets ---"
     cat "$(aosp_out)/.ninja_targets_exclude.txt" 2>/dev/null || true
